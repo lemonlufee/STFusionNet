@@ -149,31 +149,28 @@ if (-not $SkipRegime) {
 if (-not $SkipViz) {
     Write-Section "Visualization"
     $vizDir = $ExpRoot
-    
-    $latestSummary = Get-ChildItem -Path $ExpRoot -Filter "*_summary.json" -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
+
     $latestTestMetric = Get-ChildItem -Path $ExpRoot -Recurse -Filter "test_metrics.json" -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
 
-    if ($null -ne $latestSummary) {
-        $summaryPath = $latestSummary.FullName
-        Invoke-Step "Render thesis figures from summary" {
-            & $PythonPath -m visualization.viz_paper_figures `
-                --summary_json $summaryPath `
-                --out_dir $vizDir
-        }
-    } elseif ($null -ne $latestTestMetric) {
+    if ($null -ne $latestTestMetric) {
         $metricsPath = $latestTestMetric.FullName
+        $analysisPath = Join-Path $latestTestMetric.Directory.FullName "analysis_data.npz"
         Invoke-Step "Render thesis figures from metrics" {
-            & $PythonPath -m visualization.viz_paper_figures `
-                --test_metrics $metricsPath `
-                --horizon_idx 0 `
-                --out_dir $vizDir
+            $argsList = @(
+                "-m", "visualization.viz_paper_figures",
+                "--test_metrics", $metricsPath,
+                "--horizon_idx", "0",
+                "--out_dir", $vizDir
+            )
+            if (Test-Path $analysisPath) {
+                $argsList += @("--analysis_npz", $analysisPath)
+            }
+            & $PythonPath @argsList
         }
     } else {
-        Write-Host "[WARN] No summary/test metrics found. Skip inference visualizations."
+        Write-Host "[WARN] No test_metrics.json found. Skip inference visualizations."
     }
 
 }

@@ -176,22 +176,22 @@ fi
 if [[ ${SKIP_VIZ} -eq 0 ]]; then
   echo "==================== Visualization ===================="
   VIZ_DIR="${EXP_ROOT}"
-  
-  latest_summary="$(find "${EXP_ROOT}" -maxdepth 1 -type f -name "*_summary.json" 2>/dev/null | xargs -r ls -t | head -n 1 || true)"
+
   latest_test_metrics="$(find "${EXP_ROOT}" -type f -name test_metrics.json 2>/dev/null | xargs -r ls -t | head -n 1 || true)"
-  if [[ -n "${latest_summary}" ]]; then
-    run_step "Render thesis figures from summary" \
-      "${PYTHON_PATH}" -m visualization.viz_paper_figures \
-        --summary_json "${latest_summary}" \
-        --out_dir "${VIZ_DIR}"
-  elif [[ -n "${latest_test_metrics}" ]]; then
-    run_step "Render thesis figures from metrics" \
-      "${PYTHON_PATH}" -m visualization.viz_paper_figures \
-        --test_metrics "${latest_test_metrics}" \
-        --horizon_idx 0 \
-        --out_dir "${VIZ_DIR}"
+  if [[ -n "${latest_test_metrics}" ]]; then
+    analysis_npz="$(dirname "${latest_test_metrics}")/analysis_data.npz"
+    viz_args=(
+      -m visualization.viz_paper_figures
+      --test_metrics "${latest_test_metrics}"
+      --horizon_idx 0
+      --out_dir "${VIZ_DIR}"
+    )
+    if [[ -f "${analysis_npz}" ]]; then
+      viz_args+=(--analysis_npz "${analysis_npz}")
+    fi
+    run_step "Render thesis figures from metrics" "${PYTHON_PATH}" "${viz_args[@]}"
   else
-    echo "[WARN] No summary/test metrics found; skip inference visualizations."
+    echo "[WARN] No test_metrics.json found; skip inference visualizations."
   fi
 fi
 
