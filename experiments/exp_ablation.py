@@ -1,27 +1,21 @@
 r'''
-代码用法：
-脚本内置了5个消融：
-full：完整模型（对照组）
+Command-line examples:
 
-w_o_adaptive_adj：去掉 adaptive adjacency，保留地理先验图
+Run all ablation variants and save outputs under ./ablation_results:
+    python -m experiments.exp_ablation --variants all
 
-w_o_spatial_graph：移除整个空间图模块（运行时把 model.spatial 替换成“无图投影层”，不再做图卷积传播）
+Use a user-selected output directory:
+    python -m experiments.exp_ablation --variants all --results_root ./ExperimentOutputs
 
-fusion_avg：把门控融合替换为三分支简单平均（通过把 gate 参数清零并冻结，使 softmax 恒为均匀 1/3）
+Run selected variants only:
+    python -m experiments.exp_ablation --variants full,w_o_adaptive_adj,fusion_avg
 
-w_o_cyclic：移除 hour/month 的 sin-cos 循环时间特征
+Optionally evaluate robustness under random input masking:
+    python -m experiments.exp_ablation --variants all --robustness --mask_rates 0.1,0.2,0.3
 
-w_o_delta_loss：去掉 delta regularization（把 DELTA_LOSS_WEIGHT=0）
-
-
-1.默认输出：保存到项目目录下的 ablation_results/  并且跑全部消融
-python ablation_runner.py --variants all
-2.指定输出目录：会保存到位于同级目录的指定文件夹ExperimentOutputs下
-python ablation_runner.py --variants all --results_root ./ExperimentOutputs
-3.只跑指定消融：
-python ablation_runner.py --variants full,w_o_adaptive_adj,fusion_avg
-4.额外开启缺测鲁棒性评估（10/20/30% 遮蔽）
-python ablation_runner.py --variants all --robustness --mask_rates 0.1,0.2,0.3
+Built-in variants include the full model, no adaptive adjacency, single temporal
+branches, no gated fusion, no spatial graph, no cyclic time encoding, and no
+delta regularization.
 '''
 
 from __future__ import annotations

@@ -1,3 +1,1 @@
-"""实验模块：包含消融实验和参数敏感性分析"""
-
-__all__ = []
+"""Experiment entry points for ablation and graph-sensitivity analysis."""

@@ -1,3 +1,1 @@
-"""可视化模块：包含所有绘图和可视化脚本"""
-
-__all__ = []
+"""Visualization package for paper-ready figures."""

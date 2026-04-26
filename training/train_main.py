@@ -1,4 +1,4 @@
-﻿# main.py
+# main.py
 import os
 import copy
 import argparse
@@ -226,11 +226,11 @@ def train_run(
         overlap=getattr(cfg, "SPLIT_OVERLAP", cfg.SEQ_LEN),
     )
     if df_train.empty:
-        raise RuntimeError("训练集为空")
+        raise RuntimeError("Training split is empty.")
     if df_val.empty:
-        raise RuntimeError("验证集为空，请检查 TRAIN_RATIO/VAL_RATIO 或数据长度")
+        raise RuntimeError("Validation split is empty. Check TRAIN_RATIO/VAL_RATIO or data length.")
     if df_test.empty:
-        raise RuntimeError("测试集为空，请检查 TRAIN_RATIO/VAL_RATIO 或数据长度")
+        raise RuntimeError("Test split is empty. Check TRAIN_RATIO/VAL_RATIO or data length.")
 
     # Save split meta for reproducibility
     if save_artifacts:
@@ -311,12 +311,12 @@ def train_run(
             node_ids=node_ids, adj_hat=adj_hat, train_fill_means=train_fill_means_norm)
         X_test, y_test, test_times, _, _ = build_graph_windows_from_df(
             df_test_norm, cfg, input_features, cfg.TARGET_FEATURES,
-            node_ids=node_ids, adj_hat=adj_hat,  # [OK] 关键：保持节点顺序与图一致
+            node_ids=node_ids, adj_hat=adj_hat,  # Keep node order consistent with the adjacency matrix.
             train_fill_means=train_fill_means_norm
         )
 
         if X_train.size == 0 or y_train.size == 0:
-            raise RuntimeError("窗口化后训练样本为空（GNN）。请检查站点数据长度、SEQ_LEN/PRED_LEN 或 split 比例。")
+            raise RuntimeError("No training windows were built for the GNN branch. Check station data length, SEQ_LEN/PRED_LEN, or split ratios.")
         print("X_train shape:", X_train.shape, "y_train shape:", y_train.shape)
         print("y_train min/max:", y_train.min(), y_train.max())
         print("y_train zero ratio:", float((y_train == 0).mean()))
@@ -366,7 +366,7 @@ def train_run(
         )
 
         if X_train.size == 0 or y_train.size == 0:
-            raise RuntimeError("窗口化后训练样本为空。请检查所选站点的数据长度、SEQ_LEN/PRED_LEN 或 split 比例。")
+            raise RuntimeError("No training windows were built. Check selected-station data length, SEQ_LEN/PRED_LEN, or split ratios.")
 
         if save_artifacts:
             save_json({"station_names": station_names}, os.path.join(run_dir, "station_names.json"))
@@ -450,7 +450,7 @@ def train_run(
     }
     best_model_path = os.path.join(run_dir, "best_model.pt")
 
-    print(f"[TRAIN] 启动 {cfg.MODEL_NAME} 训练...")
+    print(f"[TRAIN] Starting {cfg.MODEL_NAME} training...")
     for epoch in range(1, max_epochs_i + 1):
         model.train()
         train_losses = []
@@ -630,7 +630,7 @@ def train_run(
             model.load_state_dict(best_ckpt["model_state_dict"])
         else:
             if best_state_dict is None:
-                raise RuntimeError("best_state_dict is None: save_checkpoint=False 但 do_test/do_post=True")
+                raise RuntimeError("best_state_dict is None: save_checkpoint=False while do_test/do_post=True")
             model.load_state_dict(best_state_dict)
 
     if do_test:
@@ -669,13 +669,13 @@ def train_run(
 
 def eval_run(cfg: Config):
     """
-    加载已有的模型进行评估和绘图模式
+    Load an existing run for evaluation and plotting.
     """
     if not cfg.LOAD_RUN_ID:
-        raise ValueError("使用 eval 模式必须在 config 中指定 LOAD_RUN_ID")
+        raise ValueError("LOAD_RUN_ID must be specified in config when using eval mode.")
     
     target_run_dir = os.path.join(cfg.EXP_ROOT, cfg.LOAD_RUN_ID)
-    print(f"📂 正在从以下路径加载模型: {target_run_dir}")
+    print(f"[LOAD] Loading model from: {target_run_dir}")
     
     df_raw = load_raw_data(cfg)
     df_selected = choose_target_lakes(df_raw, cfg)
@@ -806,7 +806,7 @@ def eval_run(cfg: Config):
     model.load_state_dict(ckpt["model_state_dict"])
 
     run_post_processing(model, test_loader, train_loader, input_features, cfg, target_run_dir, scaler_Y, X_test, test_times=test_times)
-    print(f"[DONE] 评估任务完成，图表已存入: {target_run_dir}")
+    print(f"[DONE] Evaluation completed. Figures saved to: {target_run_dir}")
 
 
 # ==============================
@@ -828,7 +828,7 @@ def _choice(rng: np.random.Generator, xs: List[Any]) -> Any:
 
 
 def _sample_hparams(model_name: str, rng: np.random.Generator) -> Dict[str, Any]:
-    """为不同模型定义“合理”的搜索空间。"""
+    """Define model-specific search spaces."""
     m = model_name.lower()
     params: Dict[str, Any] = {}
 
@@ -896,7 +896,7 @@ def _sample_hparams(model_name: str, rng: np.random.Generator) -> Dict[str, Any]
 
 
 def _apply_hparams(cfg: Config, params: Dict[str, Any]) -> None:
-    """把采样到的超参写入 cfg（就地修改）。"""
+    """Apply sampled hyperparameters to cfg in place."""
     for k, v in params.items():
         if hasattr(cfg, k):
             setattr(cfg, k, v)
@@ -1046,7 +1046,7 @@ def tune_then_train(
     best_params: Dict[str, Any] = {}
 
     print(
-        f"\n🔧 开始超参数搜索: model={model_name}, method={search_method}, trials={len(trial_params)}, objective={objective} ({obj_mode})"
+        f"\n[TUNE] Starting hyperparameter search: model={model_name}, method={search_method}, trials={len(trial_params)}, objective={objective} ({obj_mode})"
     )
 
     for t, params in enumerate(trial_params):
@@ -1099,7 +1099,7 @@ def tune_then_train(
         if rec.get("score") is not None and _is_better(float(rec["score"]), best_score, obj_mode):
             best_score = float(rec["score"])
             best_params = params
-            print(f"[OK] trial {t:03d} 刷新最优: score={best_score:.6f}, params={best_params}")
+            print(f"[OK] trial {t:03d} improved best score: score={best_score:.6f}, params={best_params}")
 
         if (not keep_trials) and os.path.isdir(trial_dir):
             shutil.rmtree(trial_dir, ignore_errors=True)
@@ -1150,9 +1150,9 @@ def tune_then_train(
                 seen.add(e)
             if len(uniq_errs) >= 3:
                 break
-        hint = "" if not uniq_errs else ("\n示例错误（前3条）:\n- " + "\n- ".join(uniq_errs))
+        hint = "" if not uniq_errs else ("\nExample errors (first 3):\n- " + "\n- ".join(uniq_errs))
         raise RuntimeError(
-            f"网格搜索全部失败: model={model_name}，请检查数据/模型或缩小搜索范围" + hint
+            f"All grid-search trials failed: model={model_name}. Check the data/model or reduce the search space." + hint
         )
 
     # ------------------
@@ -1171,7 +1171,7 @@ def tune_then_train(
     save_json(asdict(final_cfg), os.path.join(final_dir, "config.json"))
     save_json(best_params, os.path.join(final_dir, "best_hparams.json"))
 
-    print(f"\n🌟 使用最优超参开始最终训练: {run_id}")
+    print(f"\n[FINAL] Starting final training with best hyperparameters: {run_id}")
     final_res = train_run(
         final_cfg,
         final_dir,
@@ -1244,28 +1244,28 @@ def _apply_model_params(cfg: Config, model_name: str) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["train", "eval"], default=None)
-    parser.add_argument("--models", type=str, default=None, help="逗号分隔模型名，如 lstm,tcn,cnn")
-    parser.add_argument("--tune", action="store_true", help="强制开启自动调参")
-    parser.add_argument("--no_tune", action="store_true", help="强制关闭自动调参")
+    parser.add_argument("--models", type=str, default=None, help="Comma-separated model names, e.g. lstm,tcn,cnn")
+    parser.add_argument("--tune", action="store_true", help="Force hyperparameter tuning on")
+    parser.add_argument("--no_tune", action="store_true", help="Force hyperparameter tuning off")
     parser.add_argument(
         "--stf_mode",
         choices=["default", "search"],
         default=None,
-        help="仅对 STFusionNet(stgcn_fusion/stfusionnet) 生效：default=不调参直接训练；search=先网格搜索再训练",
+        help="Only for STFusionNet (stgcn_fusion/stfusionnet): default=train directly; search=tune then train",
     )
-    parser.add_argument("--trials", type=int, default=None, help="调参 trials 数")
+    parser.add_argument("--trials", type=int, default=None, help="Number of tuning trials")
     parser.add_argument("--objective", choices=["val_nse", "val_rmse", "val_mse"], default=None)
     parser.add_argument("--exp_root", type=str, default=None)
-    parser.add_argument("--tag", type=str, default=None, help="给 run_id 加额外后缀")
-    parser.add_argument("--load_run_id", type=str, default=None, help="eval 模式下指定 LOAD_RUN_ID")
-    parser.add_argument("--top_k_lakes", type=int, default=None, help="仅用前K个站点（加速全流程回归）")
-    parser.add_argument("--min_effective_steps", type=int, default=None, help="最小有效步数阈值")
-    parser.add_argument("--seq_len", type=int, default=None, help="覆盖配置中的 SEQ_LEN")
-    parser.add_argument("--pred_len", type=int, default=None, help="覆盖配置中的 PRED_LEN")
-    parser.add_argument("--batch_size", type=int, default=None, help="覆盖配置中的 BATCH_SIZE")
-    parser.add_argument("--max_epochs", type=int, default=None, help="覆盖配置中的 MAX_EPOCHS")
-    parser.add_argument("--no_post", action="store_true", help="禁用训练后处理绘图（timeseries/scatter 等）")
-    parser.add_argument("--no_plot_loss", action="store_true", help="禁用 loss_curve.png 绘制")
+    parser.add_argument("--tag", type=str, default=None, help="Extra suffix appended to run_id")
+    parser.add_argument("--load_run_id", type=str, default=None, help="LOAD_RUN_ID used in eval mode")
+    parser.add_argument("--top_k_lakes", type=int, default=None, help="Use only the first K selected stations for faster smoke runs")
+    parser.add_argument("--min_effective_steps", type=int, default=None, help="Minimum effective time-step threshold")
+    parser.add_argument("--seq_len", type=int, default=None, help="Override SEQ_LEN from config")
+    parser.add_argument("--pred_len", type=int, default=None, help="Override PRED_LEN from config")
+    parser.add_argument("--batch_size", type=int, default=None, help="Override BATCH_SIZE from config")
+    parser.add_argument("--max_epochs", type=int, default=None, help="Override MAX_EPOCHS from config")
+    parser.add_argument("--no_post", action="store_true", help="Disable post-training figure generation")
+    parser.add_argument("--no_plot_loss", action="store_true", help="Disable loss_curve.png generation")
     return parser.parse_args()
 
 def main():
@@ -1338,7 +1338,7 @@ def main():
         plot_loss_flag = not bool(args.no_plot_loss)
 
         all_results: List[Dict[str, Any]] = []
-        print(f"\n🧾 本次将顺序运行模型: {models}")
+        print(f"\n[RUN] Models scheduled in sequence: {models}")
         print(f"🧾 AUTO_TUNE={cfg.AUTO_TUNE}, objective={cfg.TUNE_OBJECTIVE}")
 
         for m in models:
@@ -1390,9 +1390,9 @@ def main():
                 save_json(asdict(cfg_m), os.path.join(run_dir, "config.json"))
                 # Explain why no tuning if this is STFusionNet.
                 if _is_tunable_model(m):
-                    print(f"\n🌟 开始训练(不调参, STFUSIONNET_TUNE_MODE={getattr(cfg_m,'STFUSIONNET_TUNE_MODE','')}): {run_id}")
+                    print(f"\n[TRAIN] Starting without tuning (STFUSIONNET_TUNE_MODE={getattr(cfg_m,'STFUSIONNET_TUNE_MODE','')}): {run_id}")
                 else:
-                    print(f"\n🌟 开始训练(无调参): {run_id}")
+                    print(f"\n[TRAIN] Starting without tuning: {run_id}")
                 res = train_run(
                     cfg_m,
                     run_dir,
@@ -1410,12 +1410,12 @@ def main():
 
         summary_path = os.path.join(cfg.EXP_ROOT, f"{base_run_id}_summary.json")
         save_json({"base_run_id": base_run_id, "models": models, "results": all_results}, summary_path)
-        print(f"\n[OK] 全部模型已运行完毕，汇总已保存: {summary_path}")
+        print(f"\n[OK] All models completed. Summary saved to: {summary_path}")
 
     elif cfg.MODE == "eval":
         if models:
             cfg.MODEL_NAME = models[0]
-        print(f"🔍 开始评估模式...")
+        print("[EVAL] Starting evaluation mode...")
         eval_run(cfg)
 
 if __name__ == "__main__":
