@@ -1,0 +1,29 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local data files
+*.csv
+
+# Training outputs
+Training_time_log/
+ablation_results/
+outputs/
+*.pt
+*.pth
+*.npz
+*.json
+*.png
+*.svg
+
+# Packed artifacts
+server_artifacts_*.zip
+server_artifacts_*.tar.gz
+
+# Local environments
+.venv/
+venv/
+.env
+.DS_Store
