@@ -23,19 +23,35 @@ You may also change `RAW_DATA_FILE` in `config/config_taihu.py` to point to your
 
 ## Environment Setup
 
-Create an environment from either `environment.yml` or `requirements.txt`.
-
-Conda:
+Create the conda environment:
 
 ```bash
 conda env create -f environment.yml
 conda activate stfusionnet
 ```
 
-Pip:
+On managed Linux servers, load the server-provided Anaconda module first if required, then run the same commands above. After activation, verify the environment:
+
+```bash
+python -c "import torch; print(torch.__version__); print('CUDA available:', torch.cuda.is_available()); print('CUDA:', torch.version.cuda)"
+```
+
+If conda is unavailable, use `requirements.txt` with a local virtual environment:
 
 ```bash
 python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+The PyTorch package should be compatible with the target machine. If your server already provides a working Anaconda/PyTorch stack, using that stack directly is recommended.
+
+Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
