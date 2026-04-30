@@ -59,7 +59,14 @@ class Config:
     MICE_MAX_ITER: int = 20
     MICE_RANDOM_SEED: int = 2025
     SEQ_LEN: int = 30
+    # Per-run prediction length. With 4h sampling, the default PRED_LEN=3
+    # corresponds to a 12h forecast. The full training pipeline runs the
+    # reviewer-required horizons as separate runs: 12/24/48/120/168h.
     PRED_LEN: int = 3
+    REPORT_HORIZON_HOURS: List[int] = field(default_factory=lambda: [12, 24, 48, 120, 168])
+    HORIZON_MODE: str = "single"  # single / separate
+    TARGET_HORIZON_HOURS: Optional[int] = None
+    REPORT_HORIZON_IDX: Optional[int] = None
 
     # ==============================
     # Experimental design (research-grade)
@@ -147,11 +154,10 @@ class Config:
 
 
     # ==============================
-    # Per-model hyperparameters (for convenient manual tuning)
-    # - For baseline models, the runner will NOT do grid-search; it will use the
-    #   corresponding dictionary below to override the global defaults.
-    # - For the new model (STFusionNet / stgcn_fusion), grid-search will still
-    #   sweep SEQ_LEN/BATCH_SIZE/HIDDEN (+ optional heads) based on GRID_*.
+    # Per-model hyperparameters.
+    # The open-source training pipeline uses one fixed, reproducible parameter
+    # preset per model. Hyperparameter search remains available only as an
+    # explicit CLI option, but it is not part of the default full run.
     # ==============================
     MODEL_PARAMS: Dict[str, Dict[str, object]] = field(default_factory=lambda: {
         # Baselines
@@ -243,25 +249,28 @@ class Config:
     RUN_MODELS: List[str] = field(default_factory=lambda: [])
 
     # Whether to enable auto hyper-parameter search.
-    AUTO_TUNE: bool = True
+    # Keep disabled by default for the open-source release: the full pipeline
+    # trains each model once per required forecast horizon.
+    AUTO_TUNE: bool = False
 
     # ==============================
-    # STFusionNet (stgcn_fusion / stfusionnet) tuning mode:
-    #   - "search": tune then train
+    # STFusionNet (stgcn_fusion / stfusionnet) training mode:
     #   - "default": train directly with one preset
+    #   - "search": tune then train, only when explicitly requested
     # Notes:
     #   - only affects stgcn_fusion / stfusionnet
     #   - can be overridden by CLI --stf_mode
     # ==============================
-    STFUSIONNET_TUNE_MODE: str = "search"  # search / default
-    # Max tuning combinations (<=0 means full grid).
+    STFUSIONNET_TUNE_MODE: str = "default"  # default / search
+    # Max tuning combinations for STFusionNet when search is explicitly enabled.
+    # Zero means the default open-source path performs no tuning.
     TUNE_TRIALS: int = 0
     # Shorter epochs/patience during tuning stage
     TUNE_MAX_EPOCHS: int = 30
     TUNE_EARLY_STOP_PATIENCE: int = 8
     # Tuning objective: val_nse (maximize) / val_rmse or val_mse (minimize)
     TUNE_OBJECTIVE: str = "val_nse"
-    # Search backend: grid / random / optuna / hyperband
+    # Search backend used only when explicit tuning is requested.
     # - optuna/hyperband require optional dependencies and will fallback if unavailable
     TUNE_SEARCH_METHOD: str = "grid"
     # Base random seed for tuning.
@@ -272,11 +281,11 @@ class Config:
     RUN_TAG: str = ""
 
     # ------------------------------
-    # Grid search space (paper-style)
+    # Optional search space, used only when explicit tuning is requested.
     #   - SEQ_LEN: observation window length
     #   - BATCH_SIZE
     #   - HIDDEN size (state/embedding)
-    # Default grid is modest (3*3*4=36)
+    # The default open-source run does not traverse this grid.
     # ------------------------------
     GRID_SEQ_LENS: List[int] = field(default_factory=lambda: [18, 30, 42])
     GRID_BATCH_SIZES: List[int] = field(default_factory=lambda: [32, 64, 128])

@@ -76,7 +76,8 @@ $sensSigma = "10,20,30"
 $ablationEpochs = 50
 $sensitivityEpochs = 50
 $dataArgs = @()
-$trainTuneArgs = @("--stf_mode", "search")
+$trainHorizonArgs = @("--separate_horizons", "--horizon_hours", "12,24,48,120,168")
+$trainTuneArgs = @("--no_tune", "--stf_mode", "default")
 
 if ($Mode -eq "quick") {
     # Quick smoke for server validation
@@ -88,7 +89,7 @@ if ($Mode -eq "quick") {
     $sensSigma = "10,20,30"
     $ablationEpochs = 1
     $sensitivityEpochs = 1
-    $dataArgs = @("--top_k_lakes", "4", "--min_effective_steps", "120", "--seq_len", "12", "--pred_len", "1", "--batch_size", "16")
+    $dataArgs = @("--top_k_lakes", "4", "--min_effective_steps", "120", "--seq_len", "12", "--batch_size", "16")
     $trainTuneArgs = @("--no_tune", "--stf_mode", "default", "--max_epochs", "1")
 }
 
@@ -104,7 +105,7 @@ if (-not $SkipTrain) {
             "--tag", $Tag,
             "--no_post",
             "--no_plot_loss"
-        ) + $trainTuneArgs + $dataArgs
+        ) + $trainHorizonArgs + $trainTuneArgs + $dataArgs
         & $PythonPath @argsList
     }
 }
@@ -150,9 +151,18 @@ if (-not $SkipViz) {
     Write-Section "Visualization"
     $vizDir = $ExpRoot
 
-    $latestTestMetric = Get-ChildItem -Path $ExpRoot -Recurse -Filter "test_metrics.json" -ErrorAction SilentlyContinue |
+    $summaryPath = Join-Path $ExpRoot "${Tag}_summary.json"
+    $preferredTestMetric = Get-ChildItem -Path $ExpRoot -Recurse -Filter "test_metrics.json" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Directory.Name -like "*stgcn_fusion*_${Tag}_h12h" -or $_.Directory.Name -like "*stgcn_fusion*_h12h" } |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
+
+    $latestTestMetric = $preferredTestMetric
+    if ($null -eq $latestTestMetric) {
+        $latestTestMetric = Get-ChildItem -Path $ExpRoot -Recurse -Filter "test_metrics.json" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+    }
 
     if ($null -ne $latestTestMetric) {
         $metricsPath = $latestTestMetric.FullName
@@ -161,9 +171,12 @@ if (-not $SkipViz) {
             $argsList = @(
                 "-m", "visualization.viz_paper_figures",
                 "--test_metrics", $metricsPath,
-                "--horizon_idx", "0",
+                "--plot_horizon_hours", "12",
                 "--out_dir", $vizDir
             )
+            if (Test-Path $summaryPath) {
+                $argsList += @("--summary_json", $summaryPath)
+            }
             if (Test-Path $analysisPath) {
                 $argsList += @("--analysis_npz", $analysisPath)
             }

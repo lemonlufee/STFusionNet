@@ -57,6 +57,24 @@ set_chinese_font()
 configure_stdio_for_server()
 
 
+def apply_paper_plot_style() -> None:
+    """Use the same publication-style defaults as the main figure suite."""
+    plt.rcParams.update(
+        {
+            "font.family": "Arial",
+            "axes.unicode_minus": False,
+            "figure.facecolor": "#ffffff",
+            "axes.facecolor": "#ffffff",
+            "axes.edgecolor": "#222222",
+            "axes.linewidth": 1.0,
+            "grid.color": "#c9c9c9",
+            "grid.alpha": 0.35,
+            "grid.linestyle": "--",
+            "savefig.facecolor": "#ffffff",
+        }
+    )
+
+
 def calculate_nse(y_true, y_pred):
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
@@ -604,17 +622,29 @@ def plot_timeseries_best_station(
     if len(series_payload) == 0:
         return
 
-    fig, axes = plt.subplots(2, 3, figsize=(19, 10), facecolor="white")
+    apply_paper_plot_style()
+    fig, axes = plt.subplots(3, 2, figsize=(13.1, 12.2), facecolor="white")
     flat_axes = axes.ravel()
     for i in range(6):
         ax = flat_axes[i]
         if i < len(series_payload):
             feat, t, y_t, y_p, m = series_payload[i]
-            ax.plot(t, y_p, label="Prediction", linewidth=1.3, color="#1f77b4")
-            ax.scatter(t, y_t, label="Observed", s=10, alpha=0.75, color="#1f77b4")
-            ax.set_title(feat, fontsize=12, fontweight="bold")
-            ax.set_xlabel("Time")
-            ax.set_ylabel("Value")
+            ax.plot(t, y_p, label="Prediction", linewidth=1.35, color="#2d87c8", zorder=2)
+            ax.scatter(t, y_t, label="Observed", s=9, alpha=0.56, color="#cf4e62", edgecolors="none", zorder=4)
+            ax.text(
+                -0.105,
+                1.045,
+                f"({chr(ord('a') + i)})",
+                transform=ax.transAxes,
+                ha="left",
+                va="bottom",
+                fontsize=13,
+                fontweight="bold",
+                clip_on=False,
+            )
+            ax.set_title(feat, fontsize=16, fontweight="bold", loc="left")
+            ax.set_xlabel("Date", fontsize=12.5)
+            ax.set_ylabel("Value", fontsize=12.5)
             ax.grid(True, linestyle="--", alpha=0.22)
             ax.set_xlim(t.min(), t.max())
             txt = (
@@ -624,14 +654,12 @@ def plot_timeseries_best_station(
             )
             ax.text(0.98, 0.98, txt, transform=ax.transAxes, ha="right", va="top", fontsize=9,
                     bbox=dict(boxstyle="round", facecolor="white", alpha=0.7))
-            if i == 0:
-                ax.legend(loc="lower left")
+            ax.legend(loc="upper center", bbox_to_anchor=(0.54, 1.14), fontsize=10.5, ncol=2, frameon=False, borderaxespad=0.0)
         else:
             ax.axis("off")
 
-    fig.suptitle(f"Time-Series Prediction (Station: {best_node_name})", fontsize=16, fontweight="bold")
-    fig.tight_layout(rect=[0, 0.01, 1, 0.96])
-    fig.savefig(os.path.join(out_dir, "timeseries_panel_2x3.png"), dpi=240, bbox_inches="tight", facecolor="white")
+    fig.subplots_adjust(left=0.07, right=0.985, bottom=0.07, top=0.94, wspace=0.22, hspace=0.38)
+    fig.savefig(os.path.join(out_dir, "timeseries_panel_2x3.png"), dpi=300, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
 
@@ -699,7 +727,8 @@ def plot_log_scatter_per_feature(
     if len(payload) == 0:
         return
 
-    fig, axes = plt.subplots(2, 3, figsize=(19, 10), facecolor="white")
+    apply_paper_plot_style()
+    fig, axes = plt.subplots(2, 3, figsize=(14.6, 8.9), facecolor="white")
     flat_axes = axes.ravel()
     cmap_name = "turbo" if "turbo" in plt.colormaps() else "viridis"
 
@@ -715,10 +744,21 @@ def plot_log_scatter_per_feature(
                 hi = float(np.max(np.concatenate([t, p])))
             if log_axes:
                 lo = max(lo, 1e-12)
-            ax.plot([lo, hi], [lo, hi], "r--", linewidth=1.0)
-            ax.set_title(feat, fontsize=12, fontweight="bold")
-            ax.set_xlabel("Measured")
-            ax.set_ylabel("Predicted")
+            ax.plot([lo, hi], [lo, hi], color="black", linewidth=1.2, zorder=1)
+            ax.text(
+                -0.12,
+                1.06,
+                f"({chr(ord('a') + i)})",
+                transform=ax.transAxes,
+                ha="left",
+                va="bottom",
+                fontsize=12,
+                fontweight="bold",
+                clip_on=False,
+            )
+            ax.set_title(feat, loc="left", fontsize=13.5, fontweight="bold")
+            ax.set_xlabel("Measured", fontsize=11.8)
+            ax.set_ylabel("Predicted", fontsize=11.8)
             if log_axes:
                 ax.set_xscale("log")
                 ax.set_yscale("log")
@@ -732,9 +772,8 @@ def plot_log_scatter_per_feature(
         else:
             ax.axis("off")
 
-    fig.suptitle("Measured vs Predicted Density (2x3)", fontsize=16, fontweight="bold")
-    fig.tight_layout(rect=[0, 0.01, 1, 0.96])
-    fig.savefig(os.path.join(out_dir, "density_scatter_panel_2x3.png"), dpi=240, bbox_inches="tight", facecolor="white")
+    fig.subplots_adjust(left=0.06, right=0.985, bottom=0.08, top=0.915, wspace=0.24, hspace=0.30)
+    fig.savefig(os.path.join(out_dir, "density_scatter_panel_2x3.png"), dpi=300, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 def evaluate(model, data_loader, device, criterion, *, feature_names: Optional[list] = None, nse_var_eps: float = 1e-4):
     model.eval()
@@ -902,16 +941,17 @@ def visualize_scatters(
         if not np.any(m):
             continue
 
-        fig, ax = plt.subplots(figsize=(12, 4.2))
-        ax.plot(np.asarray(x)[m], y_t[m], color="#1f77b4", linewidth=1.6, label="Observed")
-        ax.scatter(np.asarray(x)[m], y_p[m], color="darkred", s=12, alpha=0.75, label="Prediction")
-        ax.set_title(f"{feat_name} Time-Series (Station: {node_tag}, First {l} points)")
-        ax.set_xlabel("Time")
-        ax.set_ylabel("Value")
+        apply_paper_plot_style()
+        fig, ax = plt.subplots(figsize=(8.8, 4.2))
+        ax.plot(np.asarray(x)[m], y_p[m], color="#2d87c8", linewidth=1.35, label="Prediction", zorder=2)
+        ax.scatter(np.asarray(x)[m], y_t[m], color="#cf4e62", s=9, alpha=0.56, label="Observed", edgecolors="none", zorder=4)
+        ax.set_title(str(feat_name), fontsize=16, fontweight="bold", loc="left")
+        ax.set_xlabel("Date", fontsize=12.5)
+        ax.set_ylabel("Value", fontsize=12.5)
         ax.grid(True, linestyle="--", alpha=0.25)
-        ax.legend(loc="best")
+        ax.legend(loc="upper center", bbox_to_anchor=(0.54, 1.14), fontsize=10.5, ncol=2, frameon=False, borderaxespad=0.0)
         fig.tight_layout()
-        fig.savefig(os.path.join(plot_dir, f"line_{feat_name}.png"), dpi=220)
+        fig.savefig(os.path.join(plot_dir, f"line_{feat_name}.png"), dpi=300, bbox_inches="tight", facecolor="white")
         plt.close(fig)
 
     print(f"[OK] single-station plots saved: {plot_dir} (station={node_tag})")
@@ -935,9 +975,10 @@ def analyze_feature_importance_shap(model, train_loader, feature_cols, run_dir, 
     try:
         explainer = shap.GradientExplainer(model, background)
         shap_values = explainer.shap_values(test_samples)
+        apply_paper_plot_style()
         shap.summary_plot(shap_values, test_samples.cpu().numpy(), feature_names=feature_cols, show=False)
         plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, "shap_summary.png"), dpi=300)
+        plt.savefig(os.path.join(save_dir, "shap_summary.png"), dpi=300, bbox_inches="tight", facecolor="white")
         plt.close()
     except Exception as e:
         print(f"[WARN] SHAP computation failed: {e}")
@@ -966,6 +1007,7 @@ def analyze_temporal_importance_captum(model, sample_input, feature_cols, run_di
         attr = ig.attribute(sample_input)
         attr_np = attr.squeeze(0).detach().cpu().numpy().T
 
+        apply_paper_plot_style()
         plt.figure(figsize=(12, 6))
         sns.heatmap(
             attr_np,
@@ -974,9 +1016,9 @@ def analyze_temporal_importance_captum(model, sample_input, feature_cols, run_di
             yticklabels=feature_cols,
             xticklabels=[str(i) for i in range(attr_np.shape[1])],
         )
-        plt.title(f"Feature-Time Attribution (sample: {sample_id})")
+        plt.title(f"Feature-Time Attribution (sample: {sample_id})", fontsize=14, fontweight="bold", pad=8)
         plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, f"captum_heatmap_{sample_id}.png"), dpi=300)
+        plt.savefig(os.path.join(save_dir, f"captum_heatmap_{sample_id}.png"), dpi=300, bbox_inches="tight", facecolor="white")
         plt.close()
     except Exception as e:
         print(f"[WARN] Captum computation failed: {e}")

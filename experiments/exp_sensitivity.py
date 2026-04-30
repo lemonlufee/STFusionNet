@@ -261,11 +261,24 @@ def main() -> None:
             piv_nse = df.pivot(index="k", columns="sigma_km", values="test_nse").sort_index().sort_index(axis=1)
             piv_rmse = df.pivot(index="k", columns="sigma_km", values="test_rmse").sort_index().sort_index(axis=1)
 
-            fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2))
+            plt.rcParams.update(
+                {
+                    "font.family": "Arial",
+                    "axes.unicode_minus": False,
+                    "figure.facecolor": "#ffffff",
+                    "axes.facecolor": "#ffffff",
+                    "axes.edgecolor": "#222222",
+                    "axes.linewidth": 1.0,
+                    "grid.color": "#c9c9c9",
+                    "grid.alpha": 0.35,
+                    "grid.linestyle": "--",
+                }
+            )
+            fig, axes = plt.subplots(1, 2, figsize=(11.8, 4.8))
             im1 = axes[0].imshow(piv_nse.values, aspect="auto", origin="lower", cmap="YlGnBu")
-            axes[0].set_title("Test NSE")
-            axes[0].set_xlabel("sigma (km)")
-            axes[0].set_ylabel("k")
+            axes[0].set_title("Test NSE", fontsize=14, fontweight="bold", pad=8)
+            axes[0].set_xlabel("sigma (km)", fontsize=12)
+            axes[0].set_ylabel("k", fontsize=12)
             axes[0].set_xticks(range(len(piv_nse.columns)))
             axes[0].set_xticklabels([str(x) for x in piv_nse.columns])
             axes[0].set_yticks(range(len(piv_nse.index)))
@@ -273,18 +286,18 @@ def main() -> None:
             fig.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
 
             im2 = axes[1].imshow(piv_rmse.values, aspect="auto", origin="lower", cmap="YlOrRd_r")
-            axes[1].set_title("Test RMSE")
-            axes[1].set_xlabel("sigma (km)")
-            axes[1].set_ylabel("k")
+            axes[1].set_title("Test RMSE", fontsize=14, fontweight="bold", pad=8)
+            axes[1].set_xlabel("sigma (km)", fontsize=12)
+            axes[1].set_ylabel("k", fontsize=12)
             axes[1].set_xticks(range(len(piv_rmse.columns)))
             axes[1].set_xticklabels([str(x) for x in piv_rmse.columns])
             axes[1].set_yticks(range(len(piv_rmse.index)))
             axes[1].set_yticklabels([str(x) for x in piv_rmse.index])
             fig.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
 
-            fig.tight_layout()
+            fig.subplots_adjust(left=0.07, right=0.97, bottom=0.14, top=0.90, wspace=0.24)
             heat_path = os.path.join(root_dir, "graph_sensitivity_heatmaps.png")
-            fig.savefig(heat_path, dpi=300, bbox_inches="tight")
+            fig.savefig(heat_path, dpi=300, bbox_inches="tight", facecolor="white")
             plt.close(fig)
             print(f"Saved sensitivity heatmaps: {heat_path}")
         except Exception as e:

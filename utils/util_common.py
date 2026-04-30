@@ -6,8 +6,12 @@ import socket
 import platform
 import subprocess
 import numpy as np
-import torch
 from pathlib import Path
+
+try:
+    import torch
+except ImportError:  # Allows metric-only plotting utilities to run without torch.
+    torch = None
 
 def ensure_dir(path: str):
     Path(path).mkdir(parents=True, exist_ok=True)
@@ -26,7 +30,7 @@ def to_jsonable(obj):
     if isinstance(obj, np.generic):
         return obj.item()
     # torch tensor
-    if torch.is_tensor(obj):
+    if torch is not None and torch.is_tensor(obj):
         return obj.detach().cpu().tolist()
     # dict
     if isinstance(obj, dict):
@@ -49,6 +53,8 @@ def load_json(path: str):
 def set_seed(seed: int = 2025):
     random.seed(seed)
     np.random.seed(seed)
+    if torch is None:
+        return
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     if torch.backends.cudnn.is_available():
@@ -72,18 +78,19 @@ def configure_stdio_for_server() -> None:
 def collect_runtime_env() -> dict:
     """Collect lightweight runtime metadata for reproducibility/debugging."""
     py_ver = platform.python_version()
+    cuda_available = bool(torch is not None and torch.cuda.is_available())
     info = {
         "timestamp": now_str(),
         "hostname": socket.gethostname(),
         "platform": platform.platform(),
         "python_version": py_ver,
         "cwd": os.getcwd(),
-        "torch_version": getattr(torch, "__version__", "unknown"),
-        "cuda_available": bool(torch.cuda.is_available()),
-        "cuda_version": getattr(torch.version, "cuda", None),
-        "device_count": int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
+        "torch_version": getattr(torch, "__version__", "not_installed"),
+        "cuda_available": cuda_available,
+        "cuda_version": getattr(getattr(torch, "version", None), "cuda", None) if torch is not None else None,
+        "device_count": int(torch.cuda.device_count()) if cuda_available else 0,
     }
-    if torch.cuda.is_available():
+    if cuda_available:
         try:
             info["gpu_name_0"] = torch.cuda.get_device_name(0)
         except Exception:

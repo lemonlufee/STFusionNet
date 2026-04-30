@@ -110,13 +110,13 @@ Use this command when you only need to check that the core training entry point 
 Windows PowerShell:
 
 ```powershell
-python -m training.train_main --mode train --models stgcn_fusion --stf_mode default --no_tune --top_k_lakes 4 --min_effective_steps 120 --seq_len 12 --pred_len 1 --batch_size 16 --max_epochs 1 --exp_root Training_time_log\smoke_training
+python -m training.train_main --mode train --models stgcn_fusion --stf_mode default --no_tune --separate_horizons --horizon_hours 12,24,48,120,168 --top_k_lakes 4 --min_effective_steps 120 --seq_len 12 --batch_size 16 --max_epochs 1 --exp_root Training_time_log\smoke_training
 ```
 
 Linux:
 
 ```bash
-python -m training.train_main --mode train --models stgcn_fusion --stf_mode default --no_tune --top_k_lakes 4 --min_effective_steps 120 --seq_len 12 --pred_len 1 --batch_size 16 --max_epochs 1 --exp_root Training_time_log/smoke_training
+python -m training.train_main --mode train --models stgcn_fusion --stf_mode default --no_tune --separate_horizons --horizon_hours 12,24,48,120,168 --top_k_lakes 4 --min_effective_steps 120 --seq_len 12 --batch_size 16 --max_epochs 1 --exp_root Training_time_log/smoke_training
 ```
 
 ## Full Experiment Run
@@ -135,7 +135,7 @@ Linux:
 bash run_all_server.sh --mode full
 ```
 
-The full mode uses the complete model set, full ablation variants, full sensitivity settings, and tuning configuration defined in the pipeline scripts.
+The full mode uses the complete model set, full ablation variants, full sensitivity settings, and fixed one-run model presets. STFusionNet is trained in its full architecture mode without automatic hyperparameter search. Main model comparison is trained as independent forecast-horizon runs for `12h`, `24h`, `48h`, `120h`, and `168h`; each horizon has its own `PRED_LEN`, run directory, and metric record. The five forecast horizons are part of the same Full-model experiment design: they are not separate ablation variants.
 
 ## Figure Generation Notes
 
@@ -151,6 +151,8 @@ For paper reporting, figures and tables should be generated from a consistent me
 - same `test_metrics.json`;
 - same `analysis_data.npz` when inference-detail figures are used.
 
+The main comparison figures use horizon-specific runs. For example, `12h` sequence and scatter figures are computed from the final step of the `12h` run, not from an average over multiple future steps.
+
 ## Outputs
 
 Generated outputs are intentionally ignored by Git.
@@ -158,6 +160,16 @@ Generated outputs are intentionally ignored by Git.
 - Training metrics, checkpoints, and run logs are written under `Training_time_log/`.
 - Ablation and sensitivity outputs are written under `ablation_results/`.
 - Packed artifacts are created only when packaging is enabled.
+
+The main paper-style figures are written into the selected experiment root:
+
+- `nse_panels_custom.png`: STFusionNet NSE panels across the five required horizons.
+- `water_quality_nse_linear_fit.png`: NSE-horizon curves for STFusionNet and baseline models.
+- `image.png`: baseline comparison bars for NSE and RMSE.
+- `yuceshixu.png`: 12h prediction sequence panels from the selected STFusionNet run.
+- `scatter_custom.png`: 12h predicted-versus-observed scatter panels from the same run.
+- `ablation_module_matrix.png`: ablation module ON/OFF matrix.
+- `ablation_nse_panels.png`: ablation NSE panels.
 
 Before publishing or archiving the repository, keep only source code, configuration files, documentation, and environment files. Do not commit raw data, trained weights, generated figures, run logs, archives, or Python cache directories.
 

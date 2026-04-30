@@ -814,25 +814,40 @@ def main() -> None:
         df_tab.to_csv(tab_csv, index=False, encoding="utf-8-sig")
 
         # concise figure: NSE and MAE(real) across variants
-        fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.2))
+        plt.rcParams.update(
+            {
+                "font.family": "Arial",
+                "axes.unicode_minus": False,
+                "figure.facecolor": "#ffffff",
+                "axes.facecolor": "#ffffff",
+                "axes.edgecolor": "#222222",
+                "axes.linewidth": 1.0,
+                "grid.color": "#c9c9c9",
+                "grid.alpha": 0.35,
+                "grid.linestyle": "--",
+            }
+        )
+        fig, axes = plt.subplots(1, 2, figsize=(12.8, 4.8))
         x = np.arange(len(df_tab))
-        axes[0].bar(x, df_tab["test_nse"].values, color="#4C72B0")
-        axes[0].set_title("Ablation Test NSE")
-        axes[0].set_ylabel("NSE")
+        axes[0].bar(x, df_tab["test_nse"].values, color="#6f95a3", edgecolor="#4b6d78", linewidth=0.6)
+        axes[0].set_title("Ablation Test NSE", fontsize=14, fontweight="bold", pad=8)
+        axes[0].set_ylabel("NSE", fontsize=12.5)
         axes[0].set_xticks(x)
-        axes[0].set_xticklabels(df_tab["variant"].tolist(), rotation=35, ha="right")
-        axes[0].grid(axis="y", linestyle="--", alpha=0.3)
+        axes[0].set_xticklabels(df_tab["variant"].tolist(), rotation=24, ha="center", rotation_mode="anchor")
+        axes[0].tick_params(axis="x", pad=10)
+        axes[0].grid(axis="y", linestyle="--", alpha=0.28)
 
-        axes[1].bar(x, df_tab["test_real_mae"].values, color="#DD8452")
-        axes[1].set_title("Ablation Test MAE (real scale)")
-        axes[1].set_ylabel("MAE")
+        axes[1].bar(x, df_tab["test_real_mae"].values, color="#e1c999", edgecolor="#9e8456", linewidth=0.6)
+        axes[1].set_title("Ablation Test MAE", fontsize=14, fontweight="bold", pad=8)
+        axes[1].set_ylabel("MAE", fontsize=12.5)
         axes[1].set_xticks(x)
-        axes[1].set_xticklabels(df_tab["variant"].tolist(), rotation=35, ha="right")
-        axes[1].grid(axis="y", linestyle="--", alpha=0.3)
+        axes[1].set_xticklabels(df_tab["variant"].tolist(), rotation=24, ha="center", rotation_mode="anchor")
+        axes[1].tick_params(axis="x", pad=10)
+        axes[1].grid(axis="y", linestyle="--", alpha=0.28)
 
-        fig.tight_layout()
+        fig.subplots_adjust(left=0.07, right=0.985, bottom=0.26, top=0.90, wspace=0.24)
         fig_path = os.path.join(exp_dir, "ablation_summary_plots.png")
-        fig.savefig(fig_path, dpi=300, bbox_inches="tight")
+        fig.savefig(fig_path, dpi=300, bbox_inches="tight", facecolor="white")
         plt.close(fig)
         print(f"Saved ablation table: {tab_csv}")
         print(f"Saved ablation plots: {fig_path}")

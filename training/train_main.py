@@ -1,11 +1,11 @@
-# main.py
+﻿# main.py
 import os
 import copy
 import argparse
 import shutil
 import itertools
 import subprocess
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Sequence
 import time
 import torch
 import torch.nn as nn
@@ -36,12 +36,12 @@ from utils.util_common import (
 from models.model_gcn import build_model
 from evaluation.eval_metrics import (
     evaluate, plot_timeseries_best_station, plot_log_scatter_per_feature,
-    inverse_transform_lastdim, compute_metrics_per_feature, visualize_scatters,
+    inverse_transform_lastdim, compute_metrics, compute_metrics_per_feature, visualize_scatters,
     analyze_feature_importance_shap, analyze_temporal_importance_captum
 )
 
 
-# Avoid repeatedly printing dataset summary lines during grid-search.
+# Avoid repeatedly printing dataset summary lines during repeated model runs.
 _PRINTED_DF_COLS: bool = False
 from data.data_pipeline import (
     load_raw_data, choose_target_lakes, physical_cleaning,
@@ -58,6 +58,79 @@ print(f"Using device: {device}")
 
 def _compact_outputs_enabled(cfg: Config) -> bool:
     return bool(getattr(cfg, "COMPACT_OUTPUTS", True))
+
+
+def _resample_step_hours(cfg: Config) -> int:
+    """Return the sampling interval in hours from cfg.RESAMPLE_FREQ."""
+    try:
+        hours = pd.Timedelta(str(getattr(cfg, "RESAMPLE_FREQ", "4h"))).total_seconds() / 3600.0
+        return max(1, int(round(hours)))
+    except Exception:
+        return 4
+
+
+def _parse_horizon_hours(value: Optional[str], cfg: Config) -> List[int]:
+    """Parse comma-separated forecast horizons in hours."""
+    if value is None or str(value).strip() == "":
+        raw = list(getattr(cfg, "REPORT_HORIZON_HOURS", [12, 24, 48, 120, 168]))
+    else:
+        raw = [part.strip() for part in str(value).split(",") if part.strip()]
+    horizons = [int(float(x)) for x in raw]
+    if not horizons:
+        raise ValueError("At least one forecast horizon is required.")
+    step_hours = _resample_step_hours(cfg)
+    bad = [h for h in horizons if h <= 0 or h % step_hours != 0]
+    if bad:
+        raise ValueError(
+            f"Horizons must be positive and divisible by the sampling step ({step_hours}h): {bad}"
+        )
+    return horizons
+
+
+def _pred_len_for_horizon(hour: int, cfg: Config) -> int:
+    return int(hour // _resample_step_hours(cfg))
+
+
+def _report_horizon_idx(cfg: Config, y: Optional[np.ndarray] = None) -> int:
+    """Use the final step of a horizon-specific run as the reporting horizon."""
+    if getattr(cfg, "REPORT_HORIZON_IDX", None) is not None:
+        idx = int(getattr(cfg, "REPORT_HORIZON_IDX"))
+    else:
+        idx = int(getattr(cfg, "PRED_LEN", 1)) - 1
+    if y is not None and np.asarray(y).ndim >= 3:
+        idx = min(max(idx, 0), int(np.asarray(y).shape[1]) - 1)
+    return max(0, idx)
+
+
+def _select_report_horizon(y: np.ndarray, idx: int) -> np.ndarray:
+    """Keep only the reporting horizon while preserving the feature axis."""
+    arr = np.asarray(y)
+    if arr.ndim >= 3 and arr.shape[1] > idx:
+        return arr[:, idx : idx + 1, ...]
+    return arr
+
+
+def _attach_horizon_metadata(metrics: Dict[str, Any], cfg: Config, horizon_idx: Optional[int] = None) -> Dict[str, Any]:
+    idx = int(_report_horizon_idx(cfg) if horizon_idx is None else horizon_idx)
+    step_hours = _resample_step_hours(cfg)
+    target_hour = getattr(cfg, "TARGET_HORIZON_HOURS", None)
+    if target_hour is None:
+        target_hour = int((idx + 1) * step_hours)
+    metrics["horizon_mode"] = str(getattr(cfg, "HORIZON_MODE", "single"))
+    metrics["target_horizon_hours"] = int(target_hour)
+    metrics["target_horizon_idx"] = int(idx)
+    metrics["resample_step_hours"] = int(step_hours)
+    metrics["pred_len"] = int(getattr(cfg, "PRED_LEN", idx + 1))
+    return metrics
+
+
+def _use_report_horizon_scalars(metrics: Dict[str, Any], y_true: np.ndarray, y_pred: np.ndarray, cfg: Config) -> Dict[str, Any]:
+    """Replace scalar metrics with values from the target horizon only."""
+    idx = _report_horizon_idx(cfg, y_true)
+    y_true_h = _select_report_horizon(y_true, idx)
+    y_pred_h = _select_report_horizon(y_pred, idx)
+    metrics.update(compute_metrics(y_true_h, y_pred_h))
+    return _attach_horizon_metadata(metrics, cfg, idx)
 
 
 def _build_lr_scheduler(
@@ -107,15 +180,20 @@ def run_post_processing(model, test_loader, train_loader, input_features, cfg, r
     model.eval()
     criterion = nn.MSELoss()
     val_metrics, y_true, y_pred = evaluate(model, test_loader, device, criterion, feature_names=cfg.TARGET_FEATURES)
+    report_idx = _report_horizon_idx(cfg, y_true)
+    _use_report_horizon_scalars(val_metrics, y_true, y_pred, cfg)
+    y_true_real_all = inverse_transform_lastdim(scaler_Y, y_true)
+    y_pred_real_all = inverse_transform_lastdim(scaler_Y, y_pred)
 
-    # Save raw arrays for downstream inference visualizations.
+    # Save original-scale arrays for downstream inference visualizations.
     try:
         np.savez_compressed(
             os.path.join(run_dir, "analysis_data.npz"),
-            y_true=y_true,
-            y_pred=y_pred,
+            y_true=y_true_real_all,
+            y_pred=y_pred_real_all,
             target_features=np.asarray(cfg.TARGET_FEATURES, dtype=object),
             test_times=np.asarray(test_times if test_times is not None else [], dtype=object),
+            scale="original",
         )
     except Exception as e:
         print(f"[WARN] Failed to save analysis_data.npz: {e}")
@@ -125,7 +203,28 @@ def run_post_processing(model, test_loader, train_loader, input_features, cfg, r
     # visualize_scatters can correctly select a single station (node_idx).
 
     
-    # Generate the thesis figure suite from inference outputs.
+    # Save per-feature metrics in the original physical scale.
+    try:
+        y_true_report = _select_report_horizon(y_true_real_all, report_idx)
+        y_pred_report = _select_report_horizon(y_pred_real_all, report_idx)
+        metrics_by_feature_real = compute_metrics_per_feature(y_true_report, y_pred_report, cfg.TARGET_FEATURES)
+        if _compact_outputs_enabled(cfg):
+            tm_path = os.path.join(run_dir, "test_metrics.json")
+            if os.path.exists(tm_path):
+                tm = load_json(tm_path)
+                _attach_horizon_metadata(tm, cfg, report_idx)
+                tm["metrics_by_feature_real"] = metrics_by_feature_real
+                save_json(tm, tm_path)
+            else:
+                payload = _attach_horizon_metadata({"metrics_by_feature_real": metrics_by_feature_real}, cfg, report_idx)
+                save_json(payload, tm_path)
+        else:
+            save_json({"metrics_by_feature_real": metrics_by_feature_real}, os.path.join(run_dir, "metrics_by_feature_real.json"))
+    except Exception as e:
+        print(f"[WARN] Failed to save original-scale per-feature metrics: {e}")
+
+    # Generate the thesis figure suite after metrics_by_feature_real is
+    # available, so every figure reads the same metric source.
     print("1. Generating thesis figure suite from inference outputs...")
     try:
         py = sys.executable or "python"
@@ -144,23 +243,6 @@ def run_post_processing(model, test_loader, train_loader, input_features, cfg, r
     except Exception as e:
         print(f"[WARN] thesis 7-figure suite generation failed: {e}")
 
-    # Save per-feature metrics in the original physical scale.
-    try:
-        y_true_real_all = inverse_transform_lastdim(scaler_Y, y_true)
-        y_pred_real_all = inverse_transform_lastdim(scaler_Y, y_pred)
-        metrics_by_feature_real = compute_metrics_per_feature(y_true_real_all, y_pred_real_all, cfg.TARGET_FEATURES)
-        if _compact_outputs_enabled(cfg):
-            tm_path = os.path.join(run_dir, "test_metrics.json")
-            if os.path.exists(tm_path):
-                tm = load_json(tm_path)
-                tm["metrics_by_feature_real"] = metrics_by_feature_real
-                save_json(tm, tm_path)
-            else:
-                save_json({"metrics_by_feature_real": metrics_by_feature_real}, tm_path)
-        else:
-            save_json({"metrics_by_feature_real": metrics_by_feature_real}, os.path.join(run_dir, "metrics_by_feature_real.json"))
-    except Exception as e:
-        print(f"[WARN] Failed to save original-scale per-feature metrics: {e}")
     # Error-distribution plots are disabled by default.
     print("3. Skipping error-distribution plots (disabled).")
 
@@ -507,8 +589,11 @@ def train_run(
             train_losses.append(loss.item())
 
         # IMPORTANT: evaluate Train/Val each epoch for RMSE/NSE logging.
-        train_metrics, _, _ = evaluate(model, train_loader, device, criterion, feature_names=cfg.TARGET_FEATURES)
-        val_metrics, _, _ = evaluate(model, val_loader, device, criterion, feature_names=cfg.TARGET_FEATURES)
+        train_metrics, y_true_train_eval, y_pred_train_eval = evaluate(model, train_loader, device, criterion, feature_names=cfg.TARGET_FEATURES)
+        val_metrics, y_true_val_eval, y_pred_val_eval = evaluate(model, val_loader, device, criterion, feature_names=cfg.TARGET_FEATURES)
+        if str(getattr(cfg, "HORIZON_MODE", "single")).lower() == "separate":
+            train_metrics = _use_report_horizon_scalars(train_metrics, y_true_train_eval, y_pred_train_eval, cfg)
+            val_metrics = _use_report_horizon_scalars(val_metrics, y_true_val_eval, y_pred_val_eval, cfg)
 
         train_mse = float(train_metrics['mse'])
         train_rmse = float(train_metrics['rmse'])
@@ -574,8 +659,8 @@ def train_run(
         
         curr_lr = optimizer.param_groups[0]['lr']
         print(
-            f"Epoch {epoch:03d} | Train RMSE: {train_rmse:.5f} | Train NSE: {train_nse:.4f}±{train_nse_std:.4f} "
-            f"| Val RMSE: {val_rmse:.5f} | Val NSE: {val_nse:.4f}±{val_nse_std:.4f} | Val NSE(filt): {val_nse_filt:.4f}±{val_nse_filt_std:.4f} [{val_nse_filt_kept}/{val_nse_filt_total}] | LR: {curr_lr:.6f}"
+            f"Epoch {epoch:03d} | Train RMSE: {train_rmse:.5f} | Train NSE: {train_nse:.4f}+/-{train_nse_std:.4f} "
+            f"| Val RMSE: {val_rmse:.5f} | Val NSE: {val_nse:.4f}+/-{val_nse_std:.4f} | Val NSE(filt): {val_nse_filt:.4f}+/-{val_nse_filt_std:.4f} [{val_nse_filt_kept}/{val_nse_filt_total}] | LR: {curr_lr:.6f}"
         )
 
         if (epoch - best_epoch_rmse) > patience_i:
@@ -635,9 +720,35 @@ def train_run(
 
     if do_test:
         test_metrics, y_true_test, y_pred_test = evaluate(model, test_loader, device, criterion, feature_names=cfg.TARGET_FEATURES)
-        # test_metrics now includes structured NSE summaries (by station/horizon/feature) -- keep as-is.
+        report_idx = _report_horizon_idx(cfg, y_true_test)
+        _use_report_horizon_scalars(test_metrics, y_true_test, y_pred_test, cfg)
+        # test_metrics includes structured summaries; report-level feature
+        # metrics below are computed only on the target horizon of this run.
         result["test_metrics"] = test_metrics
         if save_artifacts:
+            # Keep one compact original-scale inference artifact even when
+            # --no_post is used. These arrays are the single source for
+            # sequence and scatter figures.
+            try:
+                y_true_test_real = inverse_transform_lastdim(scaler_Y, y_true_test)
+                y_pred_test_real = inverse_transform_lastdim(scaler_Y, y_pred_test)
+                y_true_report = _select_report_horizon(y_true_test_real, report_idx)
+                y_pred_report = _select_report_horizon(y_pred_test_real, report_idx)
+                test_metrics["metrics_by_feature_real"] = compute_metrics_per_feature(
+                    y_true_report,
+                    y_pred_report,
+                    cfg.TARGET_FEATURES,
+                )
+                np.savez_compressed(
+                    os.path.join(run_dir, "analysis_data.npz"),
+                    y_true=y_true_test_real,
+                    y_pred=y_pred_test_real,
+                    target_features=np.asarray(cfg.TARGET_FEATURES, dtype=object),
+                    test_times=np.asarray(test_times if test_times is not None else [], dtype=object),
+                    scale="original",
+                )
+            except Exception as e:
+                print(f"[WARN] failed to save analysis_data.npz: {e}")
             run_bundle["test_metrics"] = test_metrics
             save_json(test_metrics, os.path.join(run_dir, "test_metrics.json"))
             if not compact_outputs:
@@ -652,14 +763,32 @@ def train_run(
                     print(f"[WARN] failed to save test_outputs.npz: {e}")
 
     if do_post:
-        print("DEBUG test_times:", None if test_times is None else (type(test_times), len(test_times)))
         run_post_processing(model, test_loader, train_loader, input_features, cfg, run_dir, scaler_Y, X_test, test_times=test_times)
 
     if plot_loss and save_artifacts:
-        plt.figure(figsize=(8, 4))
-        plt.plot(history["train_loss"], label="Train Loss")
-        plt.plot(history["val_rmse"], label="Val RMSE")
-        plt.legend(); plt.savefig(os.path.join(run_dir, "loss_curve.png")); plt.close()
+        plt.rcParams.update(
+            {
+                "font.family": "Arial",
+                "axes.unicode_minus": False,
+                "figure.facecolor": "#ffffff",
+                "axes.facecolor": "#ffffff",
+                "axes.edgecolor": "#222222",
+                "axes.linewidth": 1.0,
+                "grid.color": "#c9c9c9",
+                "grid.alpha": 0.35,
+                "grid.linestyle": "--",
+            }
+        )
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.plot(history["train_loss"], label="Train Loss", color="#2d87c8", linewidth=1.4)
+        ax.plot(history["val_rmse"], label="Val RMSE", color="#cf4e62", linewidth=1.4)
+        ax.set_xlabel("Epoch", fontsize=11.5)
+        ax.set_ylabel("Loss / RMSE", fontsize=11.5)
+        ax.grid(True, linestyle="--", alpha=0.28)
+        ax.legend(loc="upper center", ncol=2, frameon=False, fontsize=10.5)
+        fig.tight_layout()
+        fig.savefig(os.path.join(run_dir, "loss_curve.png"), dpi=300, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
 
     if save_artifacts and compact_outputs:
         run_bundle["result"] = result
@@ -676,6 +805,20 @@ def eval_run(cfg: Config):
     
     target_run_dir = os.path.join(cfg.EXP_ROOT, cfg.LOAD_RUN_ID)
     print(f"[LOAD] Loading model from: {target_run_dir}")
+
+    saved_cfg_path = os.path.join(target_run_dir, "config.json")
+    if os.path.exists(saved_cfg_path):
+        runtime_scope = {
+            "MODE": cfg.MODE,
+            "EXP_ROOT": cfg.EXP_ROOT,
+            "LOAD_RUN_ID": cfg.LOAD_RUN_ID,
+        }
+        saved_cfg = load_json(saved_cfg_path)
+        for key, value in saved_cfg.items():
+            if hasattr(cfg, key):
+                setattr(cfg, key, value)
+        for key, value in runtime_scope.items():
+            setattr(cfg, key, value)
     
     df_raw = load_raw_data(cfg)
     df_selected = choose_target_lakes(df_raw, cfg)
@@ -810,7 +953,7 @@ def eval_run(cfg: Config):
 
 
 # ==============================
-# Auto hyper-parameter search (Random Search) + multi-model runner
+# Optional hyper-parameter search + multi-model runner
 # ==============================
 def _log_uniform(rng: np.random.Generator, low: float, high: float) -> float:
     """Sample from log-uniform(low, high)."""
@@ -1223,7 +1366,7 @@ def _canonical_model_key(name: str) -> str:
 
 
 def _is_tunable_model(name: str) -> bool:
-    """Only the new model (STFusionNet / STGCN_Fusion) is allowed to run grid search."""
+    """Only STFusionNet exposes optional hyperparameter search."""
     return _canonical_model_key(name) in {"stgcn_fusion"}
 
 
@@ -1254,6 +1397,12 @@ def parse_args() -> argparse.Namespace:
         help="Only for STFusionNet (stgcn_fusion/stfusionnet): default=train directly; search=tune then train",
     )
     parser.add_argument("--trials", type=int, default=None, help="Number of tuning trials")
+    parser.add_argument(
+        "--search_method",
+        choices=["grid", "random", "optuna", "hyperband"],
+        default=None,
+        help="Hyperparameter search method used only when --tune and --stf_mode search are set.",
+    )
     parser.add_argument("--objective", choices=["val_nse", "val_rmse", "val_mse"], default=None)
     parser.add_argument("--exp_root", type=str, default=None)
     parser.add_argument("--tag", type=str, default=None, help="Extra suffix appended to run_id")
@@ -1262,6 +1411,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_effective_steps", type=int, default=None, help="Minimum effective time-step threshold")
     parser.add_argument("--seq_len", type=int, default=None, help="Override SEQ_LEN from config")
     parser.add_argument("--pred_len", type=int, default=None, help="Override PRED_LEN from config")
+    parser.add_argument(
+        "--separate_horizons",
+        action="store_true",
+        help="Train independent runs for each horizon in --horizon_hours.",
+    )
+    parser.add_argument(
+        "--horizon_hours",
+        type=str,
+        default=None,
+        help="Comma-separated horizons in hours for --separate_horizons, e.g. 12,24,48,120,168.",
+    )
     parser.add_argument("--batch_size", type=int, default=None, help="Override BATCH_SIZE from config")
     parser.add_argument("--max_epochs", type=int, default=None, help="Override MAX_EPOCHS from config")
     parser.add_argument("--no_post", action="store_true", help="Disable post-training figure generation")
@@ -1286,6 +1446,8 @@ def main():
         cfg.TUNE_OBJECTIVE = args.objective
     if args.trials is not None:
         cfg.TUNE_TRIALS = int(args.trials)
+    if args.search_method is not None:
+        cfg.TUNE_SEARCH_METHOD = str(args.search_method)
     if args.tune:
         cfg.AUTO_TUNE = True
     if args.no_tune:
@@ -1301,6 +1463,8 @@ def main():
         cfg.SEQ_LEN = int(args.seq_len)
     if args.pred_len is not None:
         cfg.PRED_LEN = int(args.pred_len)
+    if args.horizon_hours is not None:
+        cfg.REPORT_HORIZON_HOURS = _parse_horizon_hours(args.horizon_hours, cfg)
     if args.batch_size is not None:
         cfg.BATCH_SIZE = int(args.batch_size)
     if args.max_epochs is not None:
@@ -1336,80 +1500,117 @@ def main():
         base_run_id = now_str()
         do_post_flag = not bool(args.no_post)
         plot_loss_flag = not bool(args.no_plot_loss)
+        horizon_hours = _parse_horizon_hours(args.horizon_hours, cfg) if args.separate_horizons else [None]
+        if args.separate_horizons and args.pred_len is not None:
+            print("[WARN] --pred_len is ignored because --separate_horizons derives PRED_LEN from --horizon_hours.")
 
         all_results: List[Dict[str, Any]] = []
         print(f"\n[RUN] Models scheduled in sequence: {models}")
-        print(f"🧾 AUTO_TUNE={cfg.AUTO_TUNE}, objective={cfg.TUNE_OBJECTIVE}")
+        if args.separate_horizons:
+            print(f"[RUN] Separate forecast horizons: {horizon_hours} hours")
+        print(f"[RUN] AUTO_TUNE={cfg.AUTO_TUNE}, objective={cfg.TUNE_OBJECTIVE}")
 
-        for m in models:
-            cfg_m = copy.deepcopy(cfg)
-            cfg_m.MODEL_NAME = m
+        for horizon_hour in horizon_hours:
+            for m in models:
+                cfg_m = copy.deepcopy(cfg)
+                cfg_m.MODEL_NAME = m
 
-            # Apply per-model default hyper-parameters (MODEL_PARAMS) if provided.
-            # This enables "one-set default params" behavior for each model.
-            _apply_model_params(cfg_m, m)
-            # Re-apply CLI overrides so smoke/quick settings are not overwritten by MODEL_PARAMS.
-            if args.seq_len is not None:
-                cfg_m.SEQ_LEN = int(args.seq_len)
-            if args.pred_len is not None:
-                cfg_m.PRED_LEN = int(args.pred_len)
-            if args.batch_size is not None:
-                cfg_m.BATCH_SIZE = int(args.batch_size)
-            if args.max_epochs is not None:
-                cfg_m.MAX_EPOCHS = int(args.max_epochs)
+                if horizon_hour is not None:
+                    pred_len = _pred_len_for_horizon(int(horizon_hour), cfg_m)
+                    cfg_m.HORIZON_MODE = "separate"
+                    cfg_m.TARGET_HORIZON_HOURS = int(horizon_hour)
+                    cfg_m.REPORT_HORIZON_IDX = int(pred_len - 1)
+                    cfg_m.PRED_LEN = int(pred_len)
+                    cfg_m.REPORT_HORIZON_HOURS = [int(horizon_hour)]
+                    tag_base = str(getattr(cfg_m, "RUN_TAG", "") or "").strip()
+                    htag = f"h{int(horizon_hour)}h"
+                    cfg_m.RUN_TAG = f"{tag_base}_{htag}" if tag_base else htag
 
-            set_seed(int(getattr(cfg_m, "TUNE_RANDOM_SEED", 2027)))
+                # Apply per-model default hyper-parameters (MODEL_PARAMS) if provided.
+                # This enables "one-set default params" behavior for each model.
+                _apply_model_params(cfg_m, m)
+                # Re-apply CLI overrides so smoke/quick settings are not overwritten by MODEL_PARAMS.
+                if args.seq_len is not None:
+                    cfg_m.SEQ_LEN = int(args.seq_len)
+                if args.pred_len is not None and horizon_hour is None:
+                    cfg_m.PRED_LEN = int(args.pred_len)
+                if horizon_hour is not None:
+                    pred_len = _pred_len_for_horizon(int(horizon_hour), cfg_m)
+                    cfg_m.PRED_LEN = int(pred_len)
+                    cfg_m.REPORT_HORIZON_IDX = int(pred_len - 1)
+                if args.batch_size is not None:
+                    cfg_m.BATCH_SIZE = int(args.batch_size)
+                if args.max_epochs is not None:
+                    cfg_m.MAX_EPOCHS = int(args.max_epochs)
 
-            # Decide whether to do hyper-parameter search.
-            # - For STFusionNet only: cfg_m.STFUSIONNET_TUNE_MODE controls default vs search.
-            # - For other models: no tuning (baseline fairness / speed).
-            do_tune = bool(cfg_m.AUTO_TUNE) and _is_tunable_model(m)
-            if _is_tunable_model(m):
-                mode = str(getattr(cfg_m, "STFUSIONNET_TUNE_MODE", "search")).lower()
-                if mode == "default":
-                    do_tune = False
-                elif mode == "search":
-                    do_tune = bool(cfg_m.AUTO_TUNE)
-                else:
-                    raise ValueError(f"Invalid STFUSIONNET_TUNE_MODE: {mode} (expected 'default' or 'search')")
+                set_seed(int(getattr(cfg_m, "TUNE_RANDOM_SEED", 2027)))
 
-            if do_tune:
-                res = tune_then_train(
-                    cfg_m,
-                    base_run_id,
-                    m,
-                    do_post=do_post_flag,
-                    plot_loss=plot_loss_flag,
-                )
-            else:
-                run_id = f"{base_run_id}_{m}"
-                if getattr(cfg_m, "RUN_TAG", ""):
-                    run_id = f"{run_id}_{cfg_m.RUN_TAG}"
-                run_dir = os.path.join(cfg_m.EXP_ROOT, run_id)
-                ensure_dir(run_dir)
-                save_json(asdict(cfg_m), os.path.join(run_dir, "config.json"))
-                # Explain why no tuning if this is STFusionNet.
+                # Decide whether to do hyper-parameter search.
+                # - For STFusionNet only: cfg_m.STFUSIONNET_TUNE_MODE controls default vs search.
+                # - For other models: no tuning (baseline fairness / speed).
+                do_tune = bool(cfg_m.AUTO_TUNE) and _is_tunable_model(m)
                 if _is_tunable_model(m):
-                    print(f"\n[TRAIN] Starting without tuning (STFUSIONNET_TUNE_MODE={getattr(cfg_m,'STFUSIONNET_TUNE_MODE','')}): {run_id}")
+                    mode = str(getattr(cfg_m, "STFUSIONNET_TUNE_MODE", "search")).lower()
+                    if mode == "default":
+                        do_tune = False
+                    elif mode == "search":
+                        do_tune = bool(cfg_m.AUTO_TUNE)
+                    else:
+                        raise ValueError(f"Invalid STFUSIONNET_TUNE_MODE: {mode} (expected 'default' or 'search')")
+
+                if do_tune:
+                    res = tune_then_train(
+                        cfg_m,
+                        base_run_id,
+                        m,
+                        do_post=do_post_flag,
+                        plot_loss=plot_loss_flag,
+                    )
                 else:
-                    print(f"\n[TRAIN] Starting without tuning: {run_id}")
-                res = train_run(
-                    cfg_m,
-                    run_dir,
-                    objective=str(getattr(cfg_m, "TUNE_OBJECTIVE", "val_mse")),
-                    max_epochs=None,
-                    early_stop_patience=None,
-                    do_test=True,
-                    do_post=do_post_flag,
-                    save_checkpoint=True,
-                    save_artifacts=True,
-                    plot_loss=plot_loss_flag,
-                )
+                    run_id = f"{base_run_id}_{m}"
+                    if getattr(cfg_m, "RUN_TAG", ""):
+                        run_id = f"{run_id}_{cfg_m.RUN_TAG}"
+                    run_dir = os.path.join(cfg_m.EXP_ROOT, run_id)
+                    ensure_dir(run_dir)
+                    save_json(asdict(cfg_m), os.path.join(run_dir, "config.json"))
+                    # Explain why no tuning if this is STFusionNet.
+                    if _is_tunable_model(m):
+                        print(f"\n[TRAIN] Starting without tuning (STFUSIONNET_TUNE_MODE={getattr(cfg_m,'STFUSIONNET_TUNE_MODE','')}): {run_id}")
+                    else:
+                        print(f"\n[TRAIN] Starting without tuning: {run_id}")
+                    res = train_run(
+                        cfg_m,
+                        run_dir,
+                        objective=str(getattr(cfg_m, "TUNE_OBJECTIVE", "val_mse")),
+                        max_epochs=None,
+                        early_stop_patience=None,
+                        do_test=True,
+                        do_post=do_post_flag,
+                        save_checkpoint=True,
+                        save_artifacts=True,
+                        plot_loss=plot_loss_flag,
+                    )
 
-            all_results.append({"model": m, **res})
+                item = {"model": m, **res}
+                if horizon_hour is not None:
+                    item["horizon_hours"] = int(horizon_hour)
+                    item["horizon_idx"] = int(_pred_len_for_horizon(int(horizon_hour), cfg_m) - 1)
+                    item["pred_len"] = int(cfg_m.PRED_LEN)
+                all_results.append(item)
 
+        summary_payload = {
+            "base_run_id": base_run_id,
+            "models": models,
+            "horizon_mode": "separate" if args.separate_horizons else "single",
+            "horizon_hours": [int(h) for h in horizon_hours if h is not None],
+            "results": all_results,
+        }
         summary_path = os.path.join(cfg.EXP_ROOT, f"{base_run_id}_summary.json")
-        save_json({"base_run_id": base_run_id, "models": models, "results": all_results}, summary_path)
+        save_json(summary_payload, summary_path)
+        if getattr(cfg, "RUN_TAG", ""):
+            tag_summary_path = os.path.join(cfg.EXP_ROOT, f"{cfg.RUN_TAG}_summary.json")
+            save_json(summary_payload, tag_summary_path)
+            print(f"[OK] Tag summary saved to: {tag_summary_path}")
         print(f"\n[OK] All models completed. Summary saved to: {summary_path}")
 
     elif cfg.MODE == "eval":
@@ -1420,3 +1621,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

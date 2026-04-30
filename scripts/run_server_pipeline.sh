@@ -49,19 +49,16 @@ if [[ -z "${PYTHON_PATH}" ]]; then
 fi
 
 sanitize_ld_library_path() {
-  # Remove known conflicting shared-stack Anaconda libs (cluster-wide paths),
-  # then prepend active conda env lib inferred from --python.
+  # Prefer the active environment's lib directory and remove duplicate
+  # entries. This keeps managed-server shared libraries from shadowing the
+  # environment selected by --python without hard-coding any institution path.
   local old_ld="${LD_LIBRARY_PATH:-}"
   local IFS=':'
   local arr=($old_ld)
   local cleaned=()
   for p in "${arr[@]}"; do
     [[ -z "${p}" ]] && continue
-    case "${p}" in
-      */seu_share/apps/anaconda3-2024.10-1/lib*) continue ;;
-      */anaconda3-2024.10-1/lib*) continue ;;
-      *) cleaned+=("${p}") ;;
-    esac
+    cleaned+=("${p}")
   done
 
   local py_bin py_dir env_dir env_lib
@@ -71,10 +68,15 @@ sanitize_ld_library_path() {
   env_lib="${env_dir}/lib"
 
   if [[ -d "${env_lib}" ]]; then
-    if [[ ${#cleaned[@]} -eq 0 ]]; then
+    local deduped=()
+    for p in "${cleaned[@]}"; do
+      [[ "${p}" == "${env_lib}" ]] && continue
+      deduped+=("${p}")
+    done
+    if [[ ${#deduped[@]} -eq 0 ]]; then
       export LD_LIBRARY_PATH="${env_lib}"
     else
-      export LD_LIBRARY_PATH="${env_lib}:$(IFS=:; echo "${cleaned[*]}")"
+      export LD_LIBRARY_PATH="${env_lib}:$(IFS=:; echo "${deduped[*]}")"
     fi
   else
     if [[ ${#cleaned[@]} -eq 0 ]]; then
@@ -113,7 +115,8 @@ SENS_SIGMA="10,20,30"
 ABLATION_EPOCHS=50
 SENS_EPOCHS=50
 DATA_ARGS=()
-TRAIN_TUNE_ARGS=(--stf_mode search)
+TRAIN_HORIZON_ARGS=(--separate_horizons --horizon_hours 12,24,48,120,168)
+TRAIN_TUNE_ARGS=(--no_tune --stf_mode default)
 
 if [[ "${MODE}" == "quick" ]]; then
   MODEL_LIST="stgcn_fusion,cnn,tcn,lstm,itransformer,patchtst,stgcn,dcrnn"
@@ -124,7 +127,7 @@ if [[ "${MODE}" == "quick" ]]; then
   SENS_SIGMA="10,20,30"
   ABLATION_EPOCHS=1
   SENS_EPOCHS=1
-  DATA_ARGS=(--top_k_lakes 4 --min_effective_steps 120 --seq_len 12 --pred_len 1 --batch_size 16)
+  DATA_ARGS=(--top_k_lakes 4 --min_effective_steps 120 --seq_len 12 --batch_size 16)
   TRAIN_TUNE_ARGS=(--no_tune --stf_mode default --max_epochs 1)
 fi
 
@@ -139,6 +142,7 @@ run_step "Main training pipeline" \
       --tag "${TAG}" \
       --no_post \
       --no_plot_loss \
+      "${TRAIN_HORIZON_ARGS[@]}" \
       "${TRAIN_TUNE_ARGS[@]}" \
       "${DATA_ARGS[@]}"
 fi
@@ -177,15 +181,26 @@ if [[ ${SKIP_VIZ} -eq 0 ]]; then
   echo "==================== Visualization ===================="
   VIZ_DIR="${EXP_ROOT}"
 
-  latest_test_metrics="$(find "${EXP_ROOT}" -type f -name test_metrics.json 2>/dev/null | xargs -r ls -t | head -n 1 || true)"
+  summary_json="${EXP_ROOT}/${TAG}_summary.json"
+  preferred_test_metrics="$(find "${EXP_ROOT}" -type f -path "*stgcn_fusion*_${TAG}_h12h/test_metrics.json" 2>/dev/null | head -n 1 || true)"
+  if [[ -z "${preferred_test_metrics}" ]]; then
+    preferred_test_metrics="$(find "${EXP_ROOT}" -type f -path "*stgcn_fusion*_h12h/test_metrics.json" 2>/dev/null | head -n 1 || true)"
+  fi
+  latest_test_metrics="${preferred_test_metrics}"
+  if [[ -z "${latest_test_metrics}" ]]; then
+    latest_test_metrics="$(find "${EXP_ROOT}" -type f -name test_metrics.json 2>/dev/null | xargs -r ls -t | head -n 1 || true)"
+  fi
   if [[ -n "${latest_test_metrics}" ]]; then
     analysis_npz="$(dirname "${latest_test_metrics}")/analysis_data.npz"
     viz_args=(
       -m visualization.viz_paper_figures
       --test_metrics "${latest_test_metrics}"
-      --horizon_idx 0
+      --plot_horizon_hours 12
       --out_dir "${VIZ_DIR}"
     )
+    if [[ -f "${summary_json}" ]]; then
+      viz_args+=(--summary_json "${summary_json}")
+    fi
     if [[ -f "${analysis_npz}" ]]; then
       viz_args+=(--analysis_npz "${analysis_npz}")
     fi
