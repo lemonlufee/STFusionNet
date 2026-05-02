@@ -14,7 +14,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.config_taihu import Config
-from training.train_main import train_run, _apply_model_params
+from training.train_main import train_run, tune_then_train, _apply_model_params
 from utils.util_common import ensure_dir, now_str, save_json, set_seed, configure_stdio_for_server, collect_runtime_env
 
 
@@ -24,6 +24,35 @@ def _parse_ints(s: str) -> List[int]:
 
 def _parse_floats(s: str) -> List[float]:
     return [float(x.strip()) for x in s.split(",") if x.strip()]
+
+
+def _resample_step_hours(cfg: Config) -> int:
+    try:
+        hours = pd.Timedelta(str(getattr(cfg, "RESAMPLE_FREQ", "4h"))).total_seconds() / 3600.0
+        return max(1, int(round(hours)))
+    except Exception:
+        return 4
+
+
+def _parse_horizon_hours(value: str, cfg: Config) -> List[int]:
+    raw = [x.strip() for x in str(value).split(",") if x.strip()]
+    if not raw:
+        raw = [str(x) for x in getattr(cfg, "REPORT_HORIZON_HOURS", [12, 24, 48, 120, 168])]
+    step = _resample_step_hours(cfg)
+    horizons = [int(float(x)) for x in raw]
+    bad = [h for h in horizons if h <= 0 or h % step != 0]
+    if bad:
+        raise ValueError(f"Horizons must be positive and divisible by {step}h: {bad}")
+    return horizons
+
+
+def _apply_horizon(cfg: Config, horizon_hour: int) -> None:
+    pred_len = int(horizon_hour // _resample_step_hours(cfg))
+    cfg.PRED_LEN = pred_len
+    cfg.HORIZON_MODE = "separate"
+    cfg.TARGET_HORIZON_HOURS = int(horizon_hour)
+    cfg.REPORT_HORIZON_IDX = int(pred_len - 1)
+    cfg.REPORT_HORIZON_HOURS = [int(horizon_hour)]
 
 
 def _safe_metrics_1d(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float, float]:
@@ -109,6 +138,11 @@ def main() -> None:
     parser.add_argument("--seq_len", type=int, default=-1)
     parser.add_argument("--pred_len", type=int, default=-1)
     parser.add_argument("--batch_size", type=int, default=-1)
+    parser.add_argument("--tune", action="store_true", help="Tune each k/sigma/horizon run before final training.")
+    parser.add_argument("--trials", type=int, default=-1, help="Maximum tuning trials per k/sigma/horizon.")
+    parser.add_argument("--search_method", choices=["grid", "random"], default="", help="Tuning search method.")
+    parser.add_argument("--separate_horizons", action="store_true", help="Run sensitivity independently for each horizon.")
+    parser.add_argument("--horizon_hours", type=str, default="12,24,48,120,168", help="Comma-separated horizons in hours.")
     args = parser.parse_args()
 
     ks = _parse_ints(args.k_values)
@@ -116,7 +150,8 @@ def main() -> None:
 
     cfg_base = Config()
     cfg_base.MODEL_NAME = "stgcn_fusion"
-    cfg_base.AUTO_TUNE = False
+    cfg_base.AUTO_TUNE = bool(args.tune)
+    cfg_base.STFUSIONNET_TUNE_MODE = "search" if args.tune else "default"
     _apply_model_params(cfg_base, cfg_base.MODEL_NAME)
     if args.exp_root:
         cfg_base.EXP_ROOT = args.exp_root
@@ -132,6 +167,10 @@ def main() -> None:
         cfg_base.PRED_LEN = int(args.pred_len)
     if args.batch_size > 0:
         cfg_base.BATCH_SIZE = int(args.batch_size)
+    if args.trials > 0:
+        cfg_base.TUNE_TRIALS = int(args.trials)
+    if args.search_method:
+        cfg_base.TUNE_SEARCH_METHOD = str(args.search_method)
 
     root_run_id = f"{now_str()}_{args.tag}"
     root_dir = os.path.join(cfg_base.EXP_ROOT, root_run_id)
@@ -143,6 +182,10 @@ def main() -> None:
             "k_values": ks,
             "sigma_values": sigmas,
             "seed": int(args.seed),
+            "tune": bool(args.tune),
+            "trials": int(getattr(cfg_base, "TUNE_TRIALS", 0)),
+            "search_method": str(getattr(cfg_base, "TUNE_SEARCH_METHOD", "grid")),
+            "horizons": _parse_horizon_hours(args.horizon_hours, cfg_base) if args.separate_horizons else [],
         },
         os.path.join(root_dir, "plan.json"),
     )
@@ -151,61 +194,87 @@ def main() -> None:
     rows_station_feature: List[Dict[str, Any]] = []
     rows_feature_agg: List[Dict[str, Any]] = []
     trial_id = 0
-    for k in ks:
-        for sigma in sigmas:
-            trial_id += 1
-            cfg = copy.deepcopy(cfg_base)
-            cfg.KNN_K = int(k)
-            cfg.KNN_SIGMA_KM = float(sigma)
-            cfg.RUN_TAG = f"k{k}_s{sigma:g}"
+    horizons = _parse_horizon_hours(args.horizon_hours, cfg_base) if args.separate_horizons else [None]
+    for horizon_hour in horizons:
+        for k in ks:
+            for sigma in sigmas:
+                trial_id += 1
+                cfg = copy.deepcopy(cfg_base)
+                cfg.KNN_K = int(k)
+                cfg.KNN_SIGMA_KM = float(sigma)
+                cfg.EXP_ROOT = root_dir
+                sens_id = f"k{k}_s{sigma:g}"
+                if horizon_hour is not None:
+                    _apply_horizon(cfg, int(horizon_hour))
+                    sens_id = f"h{int(horizon_hour)}h_k{k}_s{sigma:g}"
+                cfg.RUN_TAG = sens_id
 
-            run_id = f"{root_run_id}_k{k}_s{sigma:g}"
-            run_dir = os.path.join(cfg.EXP_ROOT, run_id)
-            ensure_dir(run_dir)
-            save_json(asdict(cfg), os.path.join(run_dir, "config.json"))
+                # Keep child run directories compact. Repeating root_run_id in
+                # nested Windows paths can exceed the 260-character path limit
+                # during torch.save, while adding no useful information.
+                run_id = sens_id
+                run_dir = os.path.join(cfg.EXP_ROOT, run_id)
 
-            set_seed(args.seed + trial_id)
-            res = train_run(
-                cfg,
-                run_dir,
-                objective=str(getattr(cfg, "TUNE_OBJECTIVE", "val_nse")),
-                max_epochs=None,
-                early_stop_patience=None,
-                do_test=True,
-                do_post=False,
-                save_checkpoint=True,
-                save_artifacts=True,
-                plot_loss=False,
-            )
+                set_seed(args.seed + trial_id)
+                if args.tune:
+                    cfg.RUN_TAG = ""
+                    res = tune_then_train(
+                        cfg,
+                        sens_id,
+                        "stgcn_fusion",
+                        do_post=False,
+                        plot_loss=False,
+                    )
+                    run_dir = str(res.get("run_dir", run_dir))
+                else:
+                    ensure_dir(run_dir)
+                    save_json(asdict(cfg), os.path.join(run_dir, "config.json"))
+                    res = train_run(
+                        cfg,
+                        run_dir,
+                        objective=str(getattr(cfg, "TUNE_OBJECTIVE", "val_nse")),
+                        max_epochs=None,
+                        early_stop_patience=None,
+                        do_test=True,
+                        do_post=False,
+                        save_checkpoint=True,
+                        save_artifacts=True,
+                        plot_loss=False,
+                    )
 
-            test_m = res.get("test_metrics", {})
-            rows.append(
-                {
-                    "k": int(k),
-                    "sigma_km": float(sigma),
-                    "best_epoch_rmse": int(res.get("best_epoch", -1)),
-                    "best_val_rmse": float(res.get("best_val_rmse", float("nan"))),
-                    "best_val_nse": float(res.get("best_val_nse", float("nan"))),
-                    "test_rmse": float(test_m.get("rmse", float("nan"))),
-                    "test_mae": float(test_m.get("mae", float("nan"))),
-                    "test_nse": float(test_m.get("nse", float("nan"))),
-                }
-            )
+                test_m = res.get("test_metrics", {})
+                rows.append(
+                    {
+                        "k": int(k),
+                        "sigma_km": float(sigma),
+                        "horizon_hours": (int(horizon_hour) if horizon_hour is not None else None),
+                        "pred_len": int(getattr(cfg, "PRED_LEN", -1)),
+                        "best_epoch_rmse": int(res.get("best_epoch", -1)),
+                        "best_val_rmse": float(res.get("best_val_rmse", float("nan"))),
+                        "best_val_nse": float(res.get("best_val_nse", float("nan"))),
+                        "test_rmse": float(test_m.get("rmse", float("nan"))),
+                        "test_mae": float(test_m.get("mae", float("nan"))),
+                        "test_nse": float(test_m.get("nse", float("nan"))),
+                    }
+                )
 
-            npz_path = os.path.join(run_dir, "test_outputs.npz")
-            if os.path.exists(npz_path):
-                try:
-                    pack = np.load(npz_path, allow_pickle=True)
-                    y_true_np = np.asarray(pack["y_true"])
-                    y_pred_np = np.asarray(pack["y_pred"])
-                    sf_rows = _compute_station_feature_rows(y_true_np, y_pred_np, list(cfg.TARGET_FEATURES))
-                    for r in sf_rows:
-                        rr = dict(r)
-                        rr["k"] = int(k)
-                        rr["sigma_km"] = float(sigma)
-                        rows_station_feature.append(rr)
-                except Exception as e:
-                    print(f"[WARN] failed to compute station-feature metrics from {npz_path}: {e}")
+                npz_path = os.path.join(run_dir, "test_outputs.npz")
+                analysis_npz_path = os.path.join(run_dir, "analysis_data.npz")
+                if os.path.exists(npz_path) or os.path.exists(analysis_npz_path):
+                    try:
+                        pack = np.load(npz_path if os.path.exists(npz_path) else analysis_npz_path, allow_pickle=True)
+                        y_true_np = np.asarray(pack["y_true"])
+                        y_pred_np = np.asarray(pack["y_pred"])
+                        sf_rows = _compute_station_feature_rows(y_true_np, y_pred_np, list(cfg.TARGET_FEATURES))
+                        for r in sf_rows:
+                            rr = dict(r)
+                            rr["k"] = int(k)
+                            rr["sigma_km"] = float(sigma)
+                            rr["horizon_hours"] = (int(horizon_hour) if horizon_hour is not None else None)
+                            rr["pred_len"] = int(getattr(cfg, "PRED_LEN", -1))
+                            rows_station_feature.append(rr)
+                    except Exception as e:
+                        print(f"[WARN] failed to compute station-feature metrics from {run_dir}: {e}")
 
     if rows_station_feature:
         df_sf = pd.DataFrame(rows_station_feature)
@@ -215,8 +284,11 @@ def main() -> None:
             encoding="utf-8-sig",
         )
 
+        group_cols = ["k", "sigma_km", "feature"]
+        if "horizon_hours" in df_sf.columns and df_sf["horizon_hours"].notna().any():
+            group_cols = ["horizon_hours", "pred_len"] + group_cols
         grp = (
-            df_sf.groupby(["k", "sigma_km", "feature"], as_index=False)
+            df_sf.groupby(group_cols, as_index=False)
             .agg(
                 nse_mean_across_stations=("nse", "mean"),
                 nse_std_across_stations=("nse", "std"),
@@ -226,7 +298,7 @@ def main() -> None:
                 mae_std_across_stations=("mae", "std"),
                 n_stations=("station_id", "nunique"),
             )
-            .sort_values(["k", "sigma_km", "feature"])
+            .sort_values(group_cols)
         )
         rows_feature_agg = grp.to_dict(orient="records")
         grp.to_csv(
@@ -236,13 +308,18 @@ def main() -> None:
         )
         save_json(
             {
-                "description": "Per-feature metrics aggregated across stations for each (k, sigma).",
+                "description": "Per-feature metrics aggregated across stations for each horizon and (k, sigma).",
                 "rows": rows_feature_agg,
             },
             os.path.join(root_dir, "graph_sensitivity_feature_station_mean.json"),
         )
 
-    df = pd.DataFrame(rows).sort_values(["test_nse", "test_rmse"], ascending=[False, True])
+    sort_cols = ["test_nse", "test_rmse"]
+    sort_asc = [False, True]
+    if rows and any(r.get("horizon_hours") is not None for r in rows):
+        sort_cols = ["horizon_hours"] + sort_cols
+        sort_asc = [True] + sort_asc
+    df = pd.DataFrame(rows).sort_values(sort_cols, ascending=sort_asc)
     csv_path = os.path.join(root_dir, "graph_sensitivity_summary.csv")
     json_path = os.path.join(root_dir, "graph_sensitivity_summary.json")
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
@@ -255,11 +332,19 @@ def main() -> None:
         json_path,
     )
 
-    # quick visual evidence for rebuttal: 2D heatmaps over (k, sigma)
+    # Compact visual evidence for rebuttal: 2D heatmaps over (k, sigma)
     if len(df) > 0:
         try:
-            piv_nse = df.pivot(index="k", columns="sigma_km", values="test_nse").sort_index().sort_index(axis=1)
-            piv_rmse = df.pivot(index="k", columns="sigma_km", values="test_rmse").sort_index().sort_index(axis=1)
+            if "horizon_hours" in df.columns and df["horizon_hours"].notna().any():
+                plot_df = df[df["horizon_hours"] == df["horizon_hours"].min()].copy()
+                heat_suffix = f"_h{int(plot_df['horizon_hours'].iloc[0])}h"
+                title_suffix = f" ({int(plot_df['horizon_hours'].iloc[0])}h)"
+            else:
+                plot_df = df.copy()
+                heat_suffix = ""
+                title_suffix = ""
+            piv_nse = plot_df.pivot(index="k", columns="sigma_km", values="test_nse").sort_index().sort_index(axis=1)
+            piv_rmse = plot_df.pivot(index="k", columns="sigma_km", values="test_rmse").sort_index().sort_index(axis=1)
 
             plt.rcParams.update(
                 {
@@ -276,7 +361,7 @@ def main() -> None:
             )
             fig, axes = plt.subplots(1, 2, figsize=(11.8, 4.8))
             im1 = axes[0].imshow(piv_nse.values, aspect="auto", origin="lower", cmap="YlGnBu")
-            axes[0].set_title("Test NSE", fontsize=14, fontweight="bold", pad=8)
+            axes[0].set_title(f"Test NSE{title_suffix}", fontsize=14, fontweight="bold", pad=8)
             axes[0].set_xlabel("sigma (km)", fontsize=12)
             axes[0].set_ylabel("k", fontsize=12)
             axes[0].set_xticks(range(len(piv_nse.columns)))
@@ -286,7 +371,7 @@ def main() -> None:
             fig.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
 
             im2 = axes[1].imshow(piv_rmse.values, aspect="auto", origin="lower", cmap="YlOrRd_r")
-            axes[1].set_title("Test RMSE", fontsize=14, fontweight="bold", pad=8)
+            axes[1].set_title(f"Test RMSE{title_suffix}", fontsize=14, fontweight="bold", pad=8)
             axes[1].set_xlabel("sigma (km)", fontsize=12)
             axes[1].set_ylabel("k", fontsize=12)
             axes[1].set_xticks(range(len(piv_rmse.columns)))
@@ -296,7 +381,7 @@ def main() -> None:
             fig.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
 
             fig.subplots_adjust(left=0.07, right=0.97, bottom=0.14, top=0.90, wspace=0.24)
-            heat_path = os.path.join(root_dir, "graph_sensitivity_heatmaps.png")
+            heat_path = os.path.join(root_dir, f"graph_sensitivity_heatmaps{heat_suffix}.png")
             fig.savefig(heat_path, dpi=300, bbox_inches="tight", facecolor="white")
             plt.close(fig)
             print(f"Saved sensitivity heatmaps: {heat_path}")

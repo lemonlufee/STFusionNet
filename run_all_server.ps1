@@ -1,7 +1,5 @@
 param(
     [string]$PythonPath = "",
-    [ValidateSet("full", "quick")]
-    [string]$Mode = "full",
     [string]$RunTag = "server",
     [string]$ExpRoot = "Training_time_log",
     [string]$AblationRoot = "ablation_results",
@@ -22,7 +20,6 @@ if (-not (Test-Path $script)) {
 $argsList = @(
     "-ExecutionPolicy", "Bypass",
     "-File", $script,
-    "-Mode", $Mode,
     "-RunTag", $RunTag,
     "-ExpRoot", $ExpRoot,
     "-AblationRoot", $AblationRoot

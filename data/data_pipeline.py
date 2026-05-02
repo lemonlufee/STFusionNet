@@ -142,6 +142,26 @@ def load_raw_data(cfg: Config) -> pd.DataFrame:
     if lat_key is not None and lat_key != "lat":
         df = df.rename(columns={lat_key: "lat"})
 
+    # Public/paper variable names are Turb and CODMn. Some historical Taihu
+    # CSV files use Tur and PI instead; normalize those aliases at load time
+    # so the rest of the pipeline has one canonical schema.
+    canonical_aliases = {
+        "Turb": ["Tur", "turb", "tur"],
+        "CODMn": ["PI", "Codmn", "CODMN", "codmn", "pi"],
+    }
+    col_lookup = {str(c).lower(): c for c in df.columns}
+    rename_map = {}
+    for canonical, aliases in canonical_aliases.items():
+        if canonical in df.columns:
+            continue
+        for alias in aliases:
+            existing = col_lookup.get(str(alias).lower())
+            if existing is not None:
+                rename_map[existing] = canonical
+                break
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
     # Coerce numeric columns explicitly (feature/target/lon/lat)
     numeric_cols = set(getattr(cfg, "FEATURE_COLS", []) + getattr(cfg, "TARGET_FEATURES", []))
     numeric_cols.update(["lon", "lat"])

@@ -3,10 +3,8 @@ set -euo pipefail
 
 # Usage examples:
 #   bash scripts/run_server_pipeline.sh
-#   bash scripts/run_server_pipeline.sh --mode quick
 #   bash scripts/run_server_pipeline.sh --python /path/to/python
 
-MODE="full"
 RUN_TAG="server"
 EXP_ROOT="Training_time_log"
 ABLATION_ROOT="ablation_results"
@@ -20,7 +18,6 @@ SKIP_PACK=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --mode) MODE="$2"; shift 2 ;;
     --python) PYTHON_PATH="$2"; shift 2 ;;
     --run-tag) RUN_TAG="$2"; shift 2 ;;
     --exp-root) EXP_ROOT="$2"; shift 2 ;;
@@ -89,7 +86,7 @@ sanitize_ld_library_path() {
 
 sanitize_ld_library_path
 
-TAG="${RUN_TAG}_${MODE}"
+TAG="${RUN_TAG}"
 
 run_step() {
   local name="$1"
@@ -103,9 +100,9 @@ echo "==================== Environment Check ===================="
 run_step "Python version" "${PYTHON_PATH}" -V
 run_step "Torch/CUDA check" "${PYTHON_PATH}" -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.version.cuda)"
 if "${PYTHON_PATH}" -c "import torch; import sys; sys.exit(0 if torch.cuda.is_available() else 1)"; then
-  run_step "Torch cuDNN smoke check" "${PYTHON_PATH}" -c "import torch; x=torch.randn(2,3,16,16,device='cuda'); m=torch.nn.Conv2d(3,8,3,padding=1).cuda(); y=m(x); print('ok', tuple(y.shape))"
+  run_step "Torch cuDNN runtime check" "${PYTHON_PATH}" -c "import torch; x=torch.randn(2,3,16,16,device='cuda'); m=torch.nn.Conv2d(3,8,3,padding=1).cuda(); y=m(x); print('ok', tuple(y.shape))"
 else
-  run_step "Torch CPU smoke check" "${PYTHON_PATH}" -c "import torch; x=torch.randn(2,3,16,16); m=torch.nn.Conv2d(3,8,3,padding=1); y=m(x); print('ok', tuple(y.shape))"
+  run_step "Torch CPU runtime check" "${PYTHON_PATH}" -c "import torch; x=torch.randn(2,3,16,16); m=torch.nn.Conv2d(3,8,3,padding=1); y=m(x); print('ok', tuple(y.shape))"
 fi
 
 MODEL_LIST="stgcn_fusion,cnn,tcn,lstm,itransformer,patchtst,stgcn,dcrnn"
@@ -116,20 +113,10 @@ ABLATION_EPOCHS=50
 SENS_EPOCHS=50
 DATA_ARGS=()
 TRAIN_HORIZON_ARGS=(--separate_horizons --horizon_hours 12,24,48,120,168)
-TRAIN_TUNE_ARGS=(--no_tune --stf_mode default)
+TRAIN_TUNE_ARGS=(--tune --stf_mode search --search_method grid --trials 48)
+ABLATION_TUNE_ARGS=(--tune --search_method grid --trials 48 --separate_horizons --horizon_hours 12,24,48,120,168)
+SENS_TUNE_ARGS=(--tune --search_method grid --trials 48 --separate_horizons --horizon_hours 12,24,48,120,168)
 
-if [[ "${MODE}" == "quick" ]]; then
-  MODEL_LIST="stgcn_fusion,cnn,tcn,lstm,itransformer,patchtst,stgcn,dcrnn"
-  # Minimal set that still satisfies reviewer-required 3 ablations:
-  # 1) no adaptive adjacency, 2) single temporal branch, 3) no gated fusion.
-  ABLATION_VARIANTS="full,w_o_adaptive_adj,temporal_cnn_only,fusion_avg"
-  SENS_K="3,6,10,15"
-  SENS_SIGMA="10,20,30"
-  ABLATION_EPOCHS=1
-  SENS_EPOCHS=1
-  DATA_ARGS=(--top_k_lakes 4 --min_effective_steps 120 --seq_len 12 --batch_size 16)
-  TRAIN_TUNE_ARGS=(--no_tune --stf_mode default --max_epochs 1)
-fi
 
 if [[ ${SKIP_TRAIN} -eq 0 ]]; then
   echo "==================== Training ===================="
@@ -155,6 +142,7 @@ if [[ ${SKIP_ABLATION} -eq 0 ]]; then
       --max_epochs "${ABLATION_EPOCHS}" \
       --results_root "${ABLATION_ROOT}" \
       --seed 2025 \
+      "${ABLATION_TUNE_ARGS[@]}" \
       "${DATA_ARGS[@]}"
 fi
 
@@ -167,6 +155,7 @@ if [[ ${SKIP_SENS} -eq 0 ]]; then
       --max_epochs "${SENS_EPOCHS}" \
       --exp_root "${ABLATION_ROOT}" \
       --tag "${TAG}_graph_sens" \
+      "${SENS_TUNE_ARGS[@]}" \
       "${DATA_ARGS[@]}"
 fi
 
@@ -192,6 +181,7 @@ if [[ ${SKIP_VIZ} -eq 0 ]]; then
   fi
   if [[ -n "${latest_test_metrics}" ]]; then
     analysis_npz="$(dirname "${latest_test_metrics}")/analysis_data.npz"
+    latest_ablation="$(find "${ABLATION_ROOT}" -type f -name ablation_results.json 2>/dev/null | xargs -r ls -t | head -n 1 || true)"
     viz_args=(
       -m visualization.viz_paper_figures
       --test_metrics "${latest_test_metrics}"
@@ -200,6 +190,9 @@ if [[ ${SKIP_VIZ} -eq 0 ]]; then
     )
     if [[ -f "${summary_json}" ]]; then
       viz_args+=(--summary_json "${summary_json}")
+    fi
+    if [[ -n "${latest_ablation}" && -f "${latest_ablation}" ]]; then
+      viz_args+=(--ablation_results "${latest_ablation}")
     fi
     if [[ -f "${analysis_npz}" ]]; then
       viz_args+=(--analysis_npz "${analysis_npz}")

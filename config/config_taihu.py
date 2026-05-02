@@ -5,7 +5,7 @@ from typing import List, Dict, Tuple, Optional
 
 DEFAULT_PHYSICAL_LIMITS: Dict[str, Tuple[float, float]] = {
     'pH': (0.0, 14.0), 'DO': (0.0, 30.0), 'TN': (0.0, 100.0),
-    'TP': (0.0, 50.0), 'Tur': (0.0, 1000.0), 'PI': (0.0, 100.0),
+    'TP': (0.0, 50.0), 'Turb': (0.0, 1000.0), 'CODMn': (0.0, 100.0),
     'Cond': (0.0, 3000.0), 'DOC': (0.0, 200.0), 'Temp': (-5.0, 45.0)
 }
 
@@ -33,8 +33,8 @@ class Config:
     # Optional: max radius (km). None means no radius limit.
     GEO_RADIUS_KM: Optional[float] = None
 
-    FEATURE_COLS: List[str] = field(default_factory=lambda: ["Temp", "DO", "TN", "Cond", "pH", "PI", "TP", "Tur"])
-    TARGET_FEATURES: List[str] = field(default_factory=lambda: ["DO","Tur","TN","TP","PI","Cond"])
+    FEATURE_COLS: List[str] = field(default_factory=lambda: ["Temp", "DO", "TN", "Cond", "pH", "CODMn", "TP", "Turb"])
+    TARGET_FEATURES: List[str] = field(default_factory=lambda: ["DO", "Turb", "TN", "TP", "CODMn", "Cond"])
     PHYSICAL_LIMITS: Dict[str, Tuple[float, float]] = field(default_factory=lambda: DEFAULT_PHYSICAL_LIMITS)
 
     RESAMPLE_FREQ: str = '4h'
@@ -249,28 +249,27 @@ class Config:
     RUN_MODELS: List[str] = field(default_factory=lambda: [])
 
     # Whether to enable auto hyper-parameter search.
-    # Keep disabled by default for the open-source release: the full pipeline
-    # trains each model once per required forecast horizon.
-    AUTO_TUNE: bool = False
+    AUTO_TUNE: bool = True
 
     # ==============================
-    # STFusionNet (stgcn_fusion / stfusionnet) training mode:
+    # STFusionNet (stgcn_fusion / stfusionnet) tuning mode:
+    #   - "search": tune then train
     #   - "default": train directly with one preset
-    #   - "search": tune then train, only when explicitly requested
     # Notes:
     #   - only affects stgcn_fusion / stfusionnet
     #   - can be overridden by CLI --stf_mode
     # ==============================
-    STFUSIONNET_TUNE_MODE: str = "default"  # default / search
-    # Max tuning combinations for STFusionNet when search is explicitly enabled.
-    # Zero means the default open-source path performs no tuning.
-    TUNE_TRIALS: int = 0
+    STFUSIONNET_TUNE_MODE: str = "search"  # default / search
+    # Max tuning combinations for STFusionNet.
+    # Keep this finite by default to avoid an exhaustive 7776-trial search
+    # when the extended hyperparameter grid is enabled.
+    TUNE_TRIALS: int = 48
     # Shorter epochs/patience during tuning stage
     TUNE_MAX_EPOCHS: int = 30
     TUNE_EARLY_STOP_PATIENCE: int = 8
     # Tuning objective: val_nse (maximize) / val_rmse or val_mse (minimize)
     TUNE_OBJECTIVE: str = "val_nse"
-    # Search backend used only when explicit tuning is requested.
+    # Search backend: grid / random / optuna / hyperband
     # - optuna/hyperband require optional dependencies and will fallback if unavailable
     TUNE_SEARCH_METHOD: str = "grid"
     # Base random seed for tuning.
@@ -281,25 +280,27 @@ class Config:
     RUN_TAG: str = ""
 
     # ------------------------------
-    # Optional search space, used only when explicit tuning is requested.
+    # Grid search space (paper-style)
     #   - SEQ_LEN: observation window length
     #   - BATCH_SIZE
     #   - HIDDEN size (state/embedding)
-    # The default open-source run does not traverse this grid.
+    # Default open-source full run tunes the three most influential dimensions:
+    # observation length, model capacity, and learning rate.
+    # Grid size: 3 * 4 * 4 = 48 trials, followed by one final training run.
     # ------------------------------
     GRID_SEQ_LENS: List[int] = field(default_factory=lambda: [18, 30, 42])
-    GRID_BATCH_SIZES: List[int] = field(default_factory=lambda: [32, 64, 128])
+    GRID_BATCH_SIZES: List[int] = field(default_factory=lambda: [64])
     GRID_HIDDEN_SIZES: List[int] = field(default_factory=lambda: [32, 64, 128, 256])
     # Extended search dimensions (to avoid only 3D search).
     GRID_LEARNING_RATES: List[float] = field(default_factory=lambda: [5e-5, 1e-4, 3e-4, 1e-3])
-    GRID_WEIGHT_DECAYS: List[float] = field(default_factory=lambda: [1e-5, 1e-4, 1e-3])
-    GRID_DROPOUT_RATES: List[float] = field(default_factory=lambda: [0.1, 0.2, 0.3])
-    GRID_LR_SCHEDULERS: List[str] = field(default_factory=lambda: ["plateau", "cosine", "warmup_cosine"])
-    GRID_WARMUP_EPOCHS: List[int] = field(default_factory=lambda: [2, 4])
+    GRID_WEIGHT_DECAYS: List[float] = field(default_factory=lambda: [1e-3])
+    GRID_DROPOUT_RATES: List[float] = field(default_factory=lambda: [0.3])
+    GRID_LR_SCHEDULERS: List[str] = field(default_factory=lambda: ["plateau"])
+    GRID_WARMUP_EPOCHS: List[int] = field(default_factory=lambda: [3])
 
     # Small extra grid for iTransformer attention heads.
     # Only combinations where (HIDDEN_DIM % NUM_HEADS == 0) will be tried.
-    GRID_ITRANSFORMER_HEADS: List[int] = field(default_factory=lambda: [1, 2, 4, 8])
+    GRID_ITRANSFORMER_HEADS: List[int] = field(default_factory=lambda: [4])
     # Runtime scheduler selection
     LR_SCHEDULER: str = "plateau"  # plateau / cosine / warmup_cosine
     WARMUP_EPOCHS: int = 3

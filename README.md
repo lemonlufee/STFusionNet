@@ -56,37 +56,23 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-## Minimal Full-Pipeline Check
+## Full Experiment Run
 
-The `quick` mode is intended for validating that the full workflow can run end-to-end with a small data subset and one training epoch. It executes:
+This open-source tree exposes only the full training pipeline.
 
-- environment checks;
-- training for STFusionNet and all baseline models;
-- a reduced ablation run;
-- graph sensitivity analysis for `k` and `sigma`;
-- feature-regime diagnostics;
-- metric-based paper-figure rendering.
+The full workflow runs training, ablation, graph-parameter sensitivity analysis, feature-regime diagnostics, visualization, and artifact packaging.
 
 Windows PowerShell:
 
 ```powershell
-.\run_all_server.ps1 `
-  -Mode quick `
-  -RunTag opensource_smoke `
-  -ExpRoot Training_time_log `
-  -AblationRoot ablation_results `
-  -SkipPack
+.
+un_all_server.ps1
 ```
 
 Linux:
 
 ```bash
-bash run_all_server.sh \
-  --mode quick \
-  --run-tag opensource_smoke \
-  --exp-root Training_time_log \
-  --ablation-root ablation_results \
-  --skip-pack
+bash run_all_server.sh
 ```
 
 If Python is not discoverable from `PATH`, pass it explicitly.
@@ -94,54 +80,31 @@ If Python is not discoverable from `PATH`, pass it explicitly.
 Windows PowerShell:
 
 ```powershell
-.\run_all_server.ps1 -Mode quick -PythonPath C:\path\to\python.exe -SkipPack
+.
+un_all_server.ps1 -PythonPath C:\path	o\python.exe
 ```
 
 Linux:
 
 ```bash
-bash run_all_server.sh --mode quick --python /path/to/python --skip-pack
+bash run_all_server.sh --python /path/to/python
 ```
 
-## Single-Model Smoke Test
+The full pipeline uses the complete model set, full ablation variants, full sensitivity settings, and horizon-specific training. Main model comparison is trained as independent forecast-horizon runs for `12h`, `24h`, `48h`, `120h`, and `168h`; each horizon has its own `PRED_LEN`, run directory, and metric record. The five forecast horizons are part of the same Full-model experiment design: they are not separate ablation variants.
 
-Use this command when you only need to check that the core training entry point works.
+The pipeline enables paper-style hyperparameter search for the main model comparison, ablation variants, and graph sensitivity runs. Each model/variant/graph-setting is tuned separately at each required forecast horizon using the same compact grid:
 
-Windows PowerShell:
+- `SEQ_LEN`: `18`, `30`, `42`;
+- hidden size: `32`, `64`, `128`, `256`;
+- learning rate: `5e-5`, `1e-4`, `3e-4`, `1e-3`.
 
-```powershell
-python -m training.train_main --mode train --models stgcn_fusion --stf_mode default --no_tune --separate_horizons --horizon_hours 12,24,48,120,168 --top_k_lakes 4 --min_effective_steps 120 --seq_len 12 --batch_size 16 --max_epochs 1 --exp_root Training_time_log\smoke_training
-```
-
-Linux:
-
-```bash
-python -m training.train_main --mode train --models stgcn_fusion --stf_mode default --no_tune --separate_horizons --horizon_hours 12,24,48,120,168 --top_k_lakes 4 --min_effective_steps 120 --seq_len 12 --batch_size 16 --max_epochs 1 --exp_root Training_time_log/smoke_training
-```
-
-## Full Experiment Run
-
-Use `full` mode for the complete training, ablation, sensitivity, diagnostics, visualization, and packaging workflow.
-
-Windows PowerShell:
-
-```powershell
-.\run_all_server.ps1 -Mode full
-```
-
-Linux:
-
-```bash
-bash run_all_server.sh --mode full
-```
-
-The full mode uses the complete model set, full ablation variants, full sensitivity settings, and fixed one-run model presets. STFusionNet is trained in its full architecture mode without automatic hyperparameter search. Main model comparison is trained as independent forecast-horizon runs for `12h`, `24h`, `48h`, `120h`, and `168h`; each horizon has its own `PRED_LEN`, run directory, and metric record. The five forecast horizons are part of the same Full-model experiment design: they are not separate ablation variants.
+This gives `48` tuning trials plus one final training run for each model/variant/graph-setting at each horizon. With the default full configuration, the expected number of training executions is `6615`: `1960` for model comparison, `1715` for ablation, and `2940` for graph-parameter sensitivity.
 
 ## Figure Generation Notes
 
 The pipeline renders metric-based figures from the latest `test_metrics.json` found under the selected experiment root.
 
-Sequence and predicted-versus-observed scatter figures require the matching `analysis_data.npz` file from the same run directory. In `quick` mode, the server pipeline intentionally uses `--no_post` to keep the validation run small, so `analysis_data.npz` may be absent and those inference-detail figures will be skipped with a warning. This warning is expected for the minimal check and does not indicate a failed run.
+Sequence and predicted-versus-observed scatter figures require the matching `analysis_data.npz` file from the same run directory. Use the same run directory for figure rendering and metric reporting to keep values self-consistent.
 
 For paper reporting, figures and tables should be generated from a consistent metric source:
 

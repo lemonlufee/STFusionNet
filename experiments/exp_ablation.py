@@ -25,7 +25,7 @@ import copy
 import math
 import os
 from dataclasses import asdict
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -42,7 +42,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.config_taihu import Config
-from evaluation.eval_metrics import calculate_nse  # reuse NSE
+from evaluation.eval_metrics import calculate_nse, compute_metrics_per_feature, inverse_transform_lastdim
 from data.data_pipeline import (
     add_time_features,
     build_graph_windows_from_df,
@@ -55,6 +55,70 @@ from data.data_pipeline import (
 )
 from models.model_gcn import build_model
 from utils.util_common import ensure_dir, now_str, save_json, set_seed, configure_stdio_for_server, collect_runtime_env
+
+
+def _resample_step_hours(cfg: Config) -> int:
+    try:
+        hours = pd.Timedelta(str(getattr(cfg, "RESAMPLE_FREQ", "4h"))).total_seconds() / 3600.0
+        return max(1, int(round(hours)))
+    except Exception:
+        return 4
+
+
+def _parse_horizon_hours(value: str, cfg: Config) -> List[int]:
+    raw = [x.strip() for x in str(value).split(",") if x.strip()]
+    if not raw:
+        raw = [str(x) for x in getattr(cfg, "REPORT_HORIZON_HOURS", [12, 24, 48, 120, 168])]
+    step = _resample_step_hours(cfg)
+    horizons = [int(float(x)) for x in raw]
+    bad = [h for h in horizons if h <= 0 or h % step != 0]
+    if bad:
+        raise ValueError(f"Horizons must be positive and divisible by {step}h: {bad}")
+    return horizons
+
+
+def _apply_horizon(cfg: Config, horizon_hour: int) -> None:
+    pred_len = int(horizon_hour // _resample_step_hours(cfg))
+    cfg.PRED_LEN = pred_len
+    cfg.HORIZON_MODE = "separate"
+    cfg.TARGET_HORIZON_HOURS = int(horizon_hour)
+    cfg.REPORT_HORIZON_IDX = int(pred_len - 1)
+    cfg.REPORT_HORIZON_HOURS = [int(horizon_hour)]
+
+
+def _ablation_grid_params(cfg: Config) -> List[Dict[str, Any]]:
+    """Three-dimension tuning grid: SEQ_LEN x hidden size x learning rate."""
+    seq_lens = list(getattr(cfg, "GRID_SEQ_LENS", [cfg.SEQ_LEN]))
+    hidden_sizes = list(getattr(cfg, "GRID_HIDDEN_SIZES", [cfg.GCN_HIDDEN_DIM]))
+    learning_rates = list(getattr(cfg, "GRID_LEARNING_RATES", [cfg.LEARNING_RATE]))
+    params: List[Dict[str, Any]] = []
+    for seq_len in seq_lens:
+        for hidden in hidden_sizes:
+            for lr in learning_rates:
+                params.append(
+                    {
+                        "SEQ_LEN": int(seq_len),
+                        "SPLIT_OVERLAP": int(seq_len),
+                        "GCN_HIDDEN_DIM": int(hidden),
+                        "FUSION_HIDDEN_DIM": int(hidden),
+                        "LEARNING_RATE": float(lr),
+                    }
+                )
+    limit = int(getattr(cfg, "TUNE_TRIALS", 0))
+    method = str(getattr(cfg, "TUNE_SEARCH_METHOD", "grid")).lower()
+    if method == "random" and limit > 0 and limit < len(params):
+        rng = np.random.default_rng(int(getattr(cfg, "TUNE_RANDOM_SEED", 2025)))
+        idx = rng.choice(len(params), size=limit, replace=False).tolist()
+        return [params[int(i)] for i in idx]
+    if method == "grid" and limit > 0:
+        return params[:limit]
+    return params
+
+
+def _apply_params(cfg: Config, params: Dict[str, Any]) -> None:
+    for key, value in params.items():
+        if hasattr(cfg, key):
+            setattr(cfg, key, value)
 
 
 # -----------------------------
@@ -380,13 +444,17 @@ def prepare_data_gnn(
     df_val_fe = add_time_features(df_val_imp)
     df_test_fe = add_time_features(df_test_imp)
 
-    scaler_X = fit_scaler(df_train_fe, input_features)
+    # Keep the same preprocessing contract as training.train_main:
+    # only sensor/value features are standardized. Periodic time features
+    # and t_index are already meaningful on their native scales.
+    scale_cols = list(cfg.FEATURE_COLS)
+    scaler_X = fit_scaler(df_train_fe, scale_cols)
     scaler_Y = fit_scaler(df_train_fe, cfg.TARGET_FEATURES)
 
     # Apply scaling
     def _apply(df_fe):
         out = df_fe.copy()
-        out[input_features] = scaler_X.transform(df_fe[input_features].values)
+        out[scale_cols] = scaler_X.transform(df_fe[scale_cols].values)
         out[cfg.TARGET_FEATURES] = scaler_Y.transform(df_fe[cfg.TARGET_FEATURES].values)
         return out
 
@@ -460,6 +528,7 @@ def train_one_variant_gnn(
     test_loader: DataLoader,
     scaler_Y,
     model_patches: Optional[List[str]] = None,
+    do_test: bool = True,
 ) -> Dict:
     """
     Train with Val selection; evaluate once on Test.
@@ -553,8 +622,27 @@ def train_one_variant_gnn(
         if (epoch - best_epoch) > cfg.EARLY_STOP_PATIENCE:
             break
 
+    best_val_nse = float("nan")
+    if history["val_nse"]:
+        try:
+            best_val_nse = float(np.nanmax(np.asarray(history["val_nse"], dtype=float)))
+        except Exception:
+            best_val_nse = float("nan")
     save_json(history, os.path.join(run_dir, "train_history.json"))
-    save_json({"best_epoch": best_epoch, "best_val_mse": best_val}, os.path.join(run_dir, "best_info.json"))
+    save_json({"best_epoch": best_epoch, "best_val_mse": best_val, "best_val_nse": best_val_nse}, os.path.join(run_dir, "best_info.json"))
+
+    if not do_test:
+        summary = {
+            "variant": variant_name,
+            "best_epoch": int(best_epoch),
+            "best_val_mse": float(best_val),
+            "best_val_nse": float(best_val_nse),
+            "applied_patches": applied,
+            "cfg_updates": {},
+            "input_dim": len(input_features),
+        }
+        save_json(summary, os.path.join(run_dir, "summary.json"))
+        return summary
 
     # Load best and test once
     ckpt = torch.load(best_path, map_location=device)
@@ -563,6 +651,18 @@ def train_one_variant_gnn(
     yt_true, yt_pred = _collect_model_outputs(model, test_loader, device)
     test_metrics = _metrics_np(yt_true, yt_pred)
     test_metrics_real = _metrics_real(scaler_Y, yt_true, yt_pred)
+    test_metrics["metrics_by_feature"] = compute_metrics_per_feature(
+        yt_true,
+        yt_pred,
+        cfg.TARGET_FEATURES,
+    )
+    yt_true_real = inverse_transform_lastdim(scaler_Y, yt_true)
+    yt_pred_real = inverse_transform_lastdim(scaler_Y, yt_pred)
+    test_metrics_real["metrics_by_feature_real"] = compute_metrics_per_feature(
+        yt_true_real,
+        yt_pred_real,
+        cfg.TARGET_FEATURES,
+    )
 
     save_json(test_metrics, os.path.join(run_dir, "test_metrics.json"))
     save_json(test_metrics_real, os.path.join(run_dir, "test_metrics_real.json"))
@@ -595,11 +695,117 @@ def train_one_variant_gnn(
         "baseline_persistence_real": base_metrics_real,
         "skill_scores": skill_scores,
         "best_epoch": int(best_epoch),
+        "best_val_mse": float(best_val),
+        "best_val_nse": float(best_val_nse),
         "applied_patches": applied,
         "cfg_updates": {},
         "input_dim": len(input_features),
     }
     save_json(summary, os.path.join(run_dir, "summary.json"))
+    return summary
+
+
+def tune_then_train_variant_gnn(
+    base_cfg: Config,
+    variant_name: str,
+    variant_def: Dict[str, Any],
+    exp_dir: str,
+    *,
+    seed: int,
+) -> Dict:
+    """Tune one ablation variant on validation data, then run one final test."""
+    tune_root = os.path.join(exp_dir, f"{variant_name}_tune")
+    ensure_dir(tune_root)
+    trial_params = _ablation_grid_params(base_cfg)
+    objective = str(getattr(base_cfg, "TUNE_OBJECTIVE", "val_nse")).lower()
+    maximize = objective == "val_nse"
+    best_score = float("-inf") if maximize else float("inf")
+    best_params: Dict[str, Any] = {}
+    records: List[Dict[str, Any]] = []
+
+    print(f"[TUNE] Ablation variant={variant_name}, trials={len(trial_params)}, objective={objective}")
+    for trial_idx, params in enumerate(trial_params):
+        cfg_trial = _clone_cfg(base_cfg)
+        for k, val in variant_def.get("cfg_updates", {}).items():
+            setattr(cfg_trial, k, val)
+        _apply_params(cfg_trial, params)
+        cfg_trial.MAX_EPOCHS = int(getattr(base_cfg, "TUNE_MAX_EPOCHS", 30))
+        cfg_trial.EARLY_STOP_PATIENCE = int(getattr(base_cfg, "TUNE_EARLY_STOP_PATIENCE", 8))
+
+        input_features = _no_cyclic_input_features(cfg_trial) if variant_def.get("input_mode") == "no_cyclic" else _default_input_features(cfg_trial)
+        trial_dir = os.path.join(
+            tune_root,
+            f"trial_{trial_idx:03d}_S{cfg_trial.SEQ_LEN}_H{cfg_trial.GCN_HIDDEN_DIM}_LR{cfg_trial.LEARNING_RATE:g}",
+        )
+        try:
+            set_seed(seed + trial_idx)
+            train_loader, val_loader, test_loader, graph_dict, _, scaler_Y = prepare_data_gnn(cfg_trial, input_features, trial_dir)
+            summary = train_one_variant_gnn(
+                cfg=cfg_trial,
+                variant_name=variant_name,
+                run_dir=trial_dir,
+                input_features=input_features,
+                graph_dict=graph_dict,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                test_loader=test_loader,
+                scaler_Y=scaler_Y,
+                model_patches=variant_def.get("patches", []),
+                do_test=False,
+            )
+            score = float(summary.get("best_val_nse" if maximize else "best_val_mse", float("nan")))
+            rec = {"trial": trial_idx, "score": score, "params": params}
+        except Exception as e:
+            rec = {"trial": trial_idx, "score": None, "params": params, "error": str(e)}
+        records.append(rec)
+        if rec.get("score") is not None:
+            score = float(rec["score"])
+            is_better = score > best_score if maximize else score < best_score
+            if is_better:
+                best_score = score
+                best_params = dict(params)
+                print(f"[OK] {variant_name} trial {trial_idx:03d} improved: score={best_score:.6f}")
+        if not bool(getattr(base_cfg, "KEEP_TRIAL_DIRS", False)) and os.path.isdir(trial_dir):
+            import shutil
+            shutil.rmtree(trial_dir, ignore_errors=True)
+
+    save_json(
+        {
+            "variant": variant_name,
+            "objective": objective,
+            "best_score": best_score,
+            "best_params": best_params,
+            "trials": records,
+            "num_trials": len(trial_params),
+        },
+        os.path.join(tune_root, "tuning_summary.json"),
+    )
+    if not best_params:
+        raise RuntimeError(f"All tuning trials failed for ablation variant: {variant_name}")
+
+    cfg_final = _clone_cfg(base_cfg)
+    for k, val in variant_def.get("cfg_updates", {}).items():
+        setattr(cfg_final, k, val)
+    _apply_params(cfg_final, best_params)
+    input_features = _no_cyclic_input_features(cfg_final) if variant_def.get("input_mode") == "no_cyclic" else _default_input_features(cfg_final)
+    run_dir = os.path.join(exp_dir, variant_name)
+    ensure_dir(run_dir)
+    save_json({"variant": variant_name, "best_hparams": best_params, "input_features": input_features}, os.path.join(run_dir, "variant_spec.json"))
+    train_loader, val_loader, test_loader, graph_dict, _, scaler_Y = prepare_data_gnn(cfg_final, input_features, run_dir)
+    summary = train_one_variant_gnn(
+        cfg=cfg_final,
+        variant_name=variant_name,
+        run_dir=run_dir,
+        input_features=input_features,
+        graph_dict=graph_dict,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        scaler_Y=scaler_Y,
+        model_patches=variant_def.get("patches", []),
+    )
+    summary["best_hparams"] = best_params
+    summary["tuning_root"] = tune_root
     return summary
 
 
@@ -670,6 +876,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=2025)
     parser.add_argument("--max_epochs", type=int, default=-1,
                         help="Override cfg.MAX_EPOCHS if >0.")
+    parser.add_argument("--tune", action="store_true", help="Tune each ablation variant before final training.")
+    parser.add_argument("--trials", type=int, default=-1, help="Maximum tuning trials per variant/horizon.")
+    parser.add_argument("--search_method", choices=["grid", "random"], default="", help="Tuning search method.")
+    parser.add_argument("--separate_horizons", action="store_true", help="Run ablations independently for each horizon.")
+    parser.add_argument("--horizon_hours", type=str, default="12,24,48,120,168", help="Comma-separated horizons in hours.")
     parser.add_argument("--top_k_lakes", type=int, default=-1, help="Override cfg.TOP_K_LAKES if >0.")
     parser.add_argument("--min_effective_steps", type=int, default=-1, help="Override cfg.MIN_EFFECTIVE_STEPS if >0.")
     parser.add_argument("--seq_len", type=int, default=-1, help="Override cfg.SEQ_LEN if >0.")
@@ -687,6 +898,13 @@ def main() -> None:
         base_cfg.EXP_ROOT = args.exp_root
     if args.max_epochs and args.max_epochs > 0:
         base_cfg.MAX_EPOCHS = args.max_epochs
+    if args.tune:
+        base_cfg.AUTO_TUNE = True
+        base_cfg.STFUSIONNET_TUNE_MODE = "search"
+    if args.trials and args.trials > 0:
+        base_cfg.TUNE_TRIALS = int(args.trials)
+    if args.search_method:
+        base_cfg.TUNE_SEARCH_METHOD = str(args.search_method)
     if args.top_k_lakes and args.top_k_lakes > 0:
         base_cfg.TOP_K_LAKES = int(args.top_k_lakes)
     if args.min_effective_steps and args.min_effective_steps > 0:
@@ -720,70 +938,94 @@ def main() -> None:
     exp_dir = os.path.join(results_root, f"ablation_{now_str()}")
     ensure_dir(exp_dir)
     save_json(collect_runtime_env(), os.path.join(exp_dir, "runtime_env.json"))
-    save_json({"chosen_variants": chosen, "base_config": asdict(base_cfg), "results_root": results_root},
+    horizons = _parse_horizon_hours(args.horizon_hours, base_cfg) if args.separate_horizons else [None]
+    save_json({"chosen_variants": chosen, "base_config": asdict(base_cfg), "results_root": results_root, "horizons": horizons},
               os.path.join(exp_dir, "exp_plan.json"))
 
     results: List[Dict] = []
 
-    for vname in chosen:
-        vdef = variants_def[vname]
-        cfg = _clone_cfg(base_cfg)
-        for k, val in vdef.get("cfg_updates", {}).items():
-            setattr(cfg, k, val)
+    for horizon_hour in horizons:
+        for vname in chosen:
+            vdef = variants_def[vname]
+            cfg = _clone_cfg(base_cfg)
+            if horizon_hour is not None:
+                _apply_horizon(cfg, int(horizon_hour))
+                cfg.RUN_TAG = f"h{int(horizon_hour)}h"
+            for k, val in vdef.get("cfg_updates", {}).items():
+                setattr(cfg, k, val)
 
-        input_features = _no_cyclic_input_features(cfg) if vdef.get("input_mode") == "no_cyclic" else _default_input_features(cfg)
-
-        run_dir = os.path.join(exp_dir, vname)
-        ensure_dir(run_dir)
-        save_json({"variant": vname, "cfg_updates": vdef.get("cfg_updates", {}), "input_features": input_features},
-                  os.path.join(run_dir, "variant_spec.json"))
-
-        train_loader, val_loader, test_loader, graph_dict, mask_feat_indices, scaler_Y = prepare_data_gnn(cfg, input_features, run_dir)
-
-        summary = train_one_variant_gnn(
-            cfg=cfg,
-            variant_name=vname,
-            run_dir=run_dir,
-            input_features=input_features,
-            graph_dict=graph_dict,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            test_loader=test_loader,
-            scaler_Y=scaler_Y,
-            model_patches=vdef.get("patches", []),
-        )
-        summary["cfg_updates"] = vdef.get("cfg_updates", {})
-        results.append(summary)
-
-        # Robustness: masked inputs on TEST, compute both normalized & real metrics
-        if args.robustness:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            model = build_model(cfg, len(input_features), len(cfg.TARGET_FEATURES), graph=graph_dict).to(device)
-            for p in vdef.get("patches", []):
-                if p == "no_graph_spatial":
-                    model.spatial = NoGraphSpatial(len(input_features), cfg.GCN_HIDDEN_DIM, cfg.DROPOUT_RATE).to(device)
-                elif p == "fusion_avg":
-                    force_average_fusion(model)
-
-            ckpt = torch.load(os.path.join(run_dir, "best_model.pth"), map_location=device)
-            model.load_state_dict(ckpt["model_state_dict"])
-
-            mask_rates = _parse_float_list(args.mask_rates)
-            masked_metrics = {}
-            for mr in mask_rates:
-                y_true_m, y_pred_m = _collect_masked_outputs(
-                    model, test_loader, device,
-                    mask_ratio=mr,
-                    mask_feat_indices=mask_feat_indices,
-                    seed=args.seed + int(mr * 1000) + 17,
+            if args.tune:
+                target_dir = os.path.join(exp_dir, f"h{int(horizon_hour)}h" if horizon_hour is not None else "single")
+                ensure_dir(target_dir)
+                summary = tune_then_train_variant_gnn(
+                    cfg,
+                    vname,
+                    vdef,
+                    target_dir,
+                    seed=args.seed + len(results) * 1000,
                 )
-                masked_metrics[str(mr)] = {
-                    "normalized": _metrics_np(y_true_m, y_pred_m),
-                    "real": _metrics_real(scaler_Y, y_true_m, y_pred_m),
-                }
+                mask_feat_indices: List[int] = []
+                train_loader = val_loader = test_loader = graph_dict = scaler_Y = None  # type: ignore[assignment]
+            else:
+                input_features = _no_cyclic_input_features(cfg) if vdef.get("input_mode") == "no_cyclic" else _default_input_features(cfg)
 
-            save_json(masked_metrics, os.path.join(run_dir, "robustness_mask_metrics.json"))
-            summary["robustness_mask"] = masked_metrics
+                run_name = vname if horizon_hour is None else os.path.join(f"h{int(horizon_hour)}h", vname)
+                run_dir = os.path.join(exp_dir, run_name)
+                ensure_dir(run_dir)
+                save_json({"variant": vname, "cfg_updates": vdef.get("cfg_updates", {}), "input_features": input_features},
+                          os.path.join(run_dir, "variant_spec.json"))
+
+                train_loader, val_loader, test_loader, graph_dict, mask_feat_indices, scaler_Y = prepare_data_gnn(cfg, input_features, run_dir)
+
+                summary = train_one_variant_gnn(
+                    cfg=cfg,
+                    variant_name=vname,
+                    run_dir=run_dir,
+                    input_features=input_features,
+                    graph_dict=graph_dict,
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    test_loader=test_loader,
+                    scaler_Y=scaler_Y,
+                    model_patches=vdef.get("patches", []),
+                )
+            summary["cfg_updates"] = vdef.get("cfg_updates", {})
+            if horizon_hour is not None:
+                summary["horizon_hours"] = int(horizon_hour)
+                summary["pred_len"] = int(cfg.PRED_LEN)
+
+            # Robustness: masked inputs on TEST, compute both normalized & real metrics.
+            # This is evaluated only after a non-tuned final variant has been trained.
+            if args.robustness and (not args.tune):
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                model = build_model(cfg, len(input_features), len(cfg.TARGET_FEATURES), graph=graph_dict).to(device)
+                for p in vdef.get("patches", []):
+                    if p == "no_graph_spatial":
+                        model.spatial = NoGraphSpatial(len(input_features), cfg.GCN_HIDDEN_DIM, cfg.DROPOUT_RATE).to(device)
+                    elif p == "fusion_avg":
+                        force_average_fusion(model)
+
+                ckpt = torch.load(os.path.join(run_dir, "best_model.pth"), map_location=device)
+                model.load_state_dict(ckpt["model_state_dict"])
+
+                mask_rates = _parse_float_list(args.mask_rates)
+                masked_metrics = {}
+                for mr in mask_rates:
+                    y_true_m, y_pred_m = _collect_masked_outputs(
+                        model, test_loader, device,
+                        mask_ratio=mr,
+                        mask_feat_indices=mask_feat_indices,
+                        seed=args.seed + int(mr * 1000) + 17,
+                    )
+                    masked_metrics[str(mr)] = {
+                        "normalized": _metrics_np(y_true_m, y_pred_m),
+                        "real": _metrics_real(scaler_Y, y_true_m, y_pred_m),
+                    }
+
+                save_json(masked_metrics, os.path.join(run_dir, "robustness_mask_metrics.json"))
+                summary["robustness_mask"] = masked_metrics
+
+            results.append(summary)
 
     save_json(results, os.path.join(exp_dir, "ablation_results.json"))
 

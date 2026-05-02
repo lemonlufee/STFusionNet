@@ -15,6 +15,8 @@ from matplotlib.patches import Rectangle
 
 from utils.util_common import configure_stdio_for_server
 
+# Use public/paper variable names while keeping aliases for historical CSV
+# columns and older result files.
 FEATURE_ORDER = ["Cond", "DO", "Turb", "TN", "TP", "CODMn"]
 FEATURE_ALIASES = {
     "Cond": ["Cond"],
@@ -32,6 +34,14 @@ FEATURE_UNITS = {
     "TP": "mg/L",
     "CODMn": "mg/L",
 }
+ABLATION_VARIANT_ORDER = [
+    ("No A-Adj", "w_o_adaptive_adj"),
+    ("Single-CNN", "temporal_cnn_only"),
+    ("Single-LSTM", "temporal_lstm_only"),
+    ("Single-TCN", "temporal_tcn_only"),
+    ("No G-Fusion", "fusion_avg"),
+    ("Full", "full"),
+]
 MODEL_ORDER = ["CNN", "TCN", "LSTM", "iTransformer", "PatchTST", "STGCN", "DCRNN", "STFusionNet"]
 MODEL_KEYS = {
     "cnn": "CNN",
@@ -209,7 +219,7 @@ def arrays_for_feature(y_true: np.ndarray, y_pred: np.ndarray, features: List[st
     return y_true[:, fidx], y_pred[:, fidx]
 
 
-def quick_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float, float]:
+def compute_basic_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float, float]:
     t = np.asarray(y_true, dtype=float).reshape(-1)
     p = np.asarray(y_pred, dtype=float).reshape(-1)
     mask = np.isfinite(t) & np.isfinite(p)
@@ -308,6 +318,96 @@ def select_model_metrics_for_horizon(
         else:
             selected[name] = metrics
     return selected
+
+
+def resolve_json_path(path_or_dir: str, pattern: str) -> str:
+    """Return a JSON file path from either a file or a directory tree."""
+    if not path_or_dir:
+        return ""
+    path = Path(path_or_dir)
+    if path.is_file():
+        return str(path)
+    if not path.exists() or not path.is_dir():
+        return ""
+    matches = sorted(path.rglob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    return str(matches[0]) if matches else ""
+
+
+def load_ablation_results(path_or_dir: str) -> List[Dict[str, Any]]:
+    path = resolve_json_path(path_or_dir, "ablation_results.json")
+    if not path:
+        return []
+    try:
+        payload = load_json(path)
+        if isinstance(payload, list):
+            return [x for x in payload if isinstance(x, dict)]
+        if isinstance(payload, dict):
+            rows = payload.get("rows") or payload.get("results") or []
+            if isinstance(rows, list):
+                return [x for x in rows if isinstance(x, dict)]
+    except Exception as exc:
+        print(f"[WARN] failed to load ablation results from {path}: {exc}")
+    return []
+
+
+def _variant_name(item: Dict[str, Any]) -> str:
+    return str(item.get("variant", "")).strip()
+
+
+def _horizon_matches(item: Dict[str, Any], target_horizon_hours: Optional[int]) -> bool:
+    if target_horizon_hours is None:
+        return True
+    hour = item.get("horizon_hours")
+    if hour is None:
+        return True
+    try:
+        return int(hour) == int(target_horizon_hours)
+    except Exception:
+        return False
+
+
+def select_ablation_result(
+    rows: Sequence[Dict[str, Any]],
+    variant: str,
+    target_horizon_hours: Optional[int],
+) -> Optional[Dict[str, Any]]:
+    candidates = [r for r in rows if _variant_name(r) == variant and _horizon_matches(r, target_horizon_hours)]
+    if not candidates:
+        candidates = [r for r in rows if _variant_name(r) == variant]
+    if not candidates:
+        return None
+    if target_horizon_hours is None:
+        return candidates[0]
+    exact = [r for r in candidates if r.get("horizon_hours") is not None and int(r.get("horizon_hours")) == int(target_horizon_hours)]
+    return exact[0] if exact else candidates[0]
+
+
+def _feature_metric_from_container(container: Dict[str, Any], feature: str, metric: str) -> float:
+    if not isinstance(container, dict):
+        return float("nan")
+    for key in ("metrics_by_feature_real", "metrics_by_feature"):
+        by_feature = container.get(key)
+        if not isinstance(by_feature, dict):
+            continue
+        for alias in feature_aliases(feature):
+            item = by_feature.get(alias)
+            if isinstance(item, dict):
+                value = safe_float(item.get(metric.lower()))
+                if np.isfinite(value):
+                    return value
+    return safe_float(container.get(metric.lower()))
+
+
+def ablation_feature_metric(item: Optional[Dict[str, Any]], feature: str, metric: str) -> float:
+    if item is None:
+        return float("nan")
+    for key in ("test_real", "test", "test_metrics"):
+        container = item.get(key)
+        if isinstance(container, dict):
+            value = _feature_metric_from_container(container, feature, metric)
+            if np.isfinite(value):
+                return value
+    return safe_float(item.get(metric.lower()))
 
 
 def ordered_model_names(model_metrics: Dict[str, Dict[str, Any]]) -> List[str]:
@@ -507,27 +607,43 @@ def shade_list(base_color: str, n: int) -> List[Tuple[float, float, float]]:
     return colors
 
 
-def save_nse_panels(metrics: Dict[str, Any], out_dir: Path) -> None:
+def save_nse_panels(
+    metrics: Dict[str, Any],
+    out_dir: Path,
+    ablation_results: Optional[Sequence[Dict[str, Any]]] = None,
+    target_horizon_hours: Optional[int] = None,
+) -> None:
     apply_paper_style()
-    labels = ["No A-Adj", "Single-CNN", "Single-LSTM", "Single-TCN", "No G-Fusion", "Full"]
-    drops = np.array([0.10, 0.09, 0.08, 0.085, 0.06, 0.0])
+    labels = [x[0] for x in ABLATION_VARIANT_ORDER]
     feature_colors = ["#1f77b4", "#2ca02c", "#ff9800", "#1f9eb7", "#9c27b0", "#d7191c"]
     fig, axes = plt.subplots(3, 2, figsize=(14.2, 12.4), sharey=True)
     axes_flat = axes.reshape(-1)
     sub_labels = ["(b)", "(c)", "(d)", "(e)", "(f)", "(g)"]
+    ablation_rows = list(ablation_results or [])
+    if not ablation_rows:
+        print("[WARN] ablation_results.json was not provided; ablation NSE panels will contain available Full metrics only.")
     for i, (ax, feature) in enumerate(zip(axes_flat, FEATURE_ORDER)):
-        base = feature_metric(metrics, feature, "nse")
-        if not np.isfinite(base):
-            base = safe_float(metrics.get("nse"), 0.78)
-        vals = np.clip(base - drops, -1.0, 1.0)
+        vals = []
+        for _label, variant in ABLATION_VARIANT_ORDER:
+            item = select_ablation_result(ablation_rows, variant, target_horizon_hours)
+            value = ablation_feature_metric(item, feature, "nse")
+            if not np.isfinite(value) and variant == "full":
+                value = feature_metric(metrics, feature, "nse")
+                if not np.isfinite(value):
+                    value = safe_float(metrics.get("nse"))
+            vals.append(value)
+        vals = np.asarray(vals, dtype=float)
         x = np.arange(len(labels), dtype=float)
-        ax.bar(x, vals, yerr=np.full_like(vals, 0.02), width=0.78, color=shade_list(feature_colors[i], len(labels)), edgecolor="white", linewidth=0.8, capsize=3.0, error_kw=dict(ecolor="#333333", lw=0.9))
+        draw_vals = np.where(np.isfinite(vals), vals, 0.0)
+        err_vals = np.where(np.isfinite(vals), 0.02, 0.0)
+        ax.bar(x, draw_vals, yerr=err_vals, width=0.78, color=shade_list(feature_colors[i], len(labels)), edgecolor="white", linewidth=0.8, capsize=3.0, error_kw=dict(ecolor="#333333", lw=0.9))
         ax.set_title(feature, fontsize=20, fontweight="bold", pad=7)
         ax.set_xticks(x)
         ax.set_xticklabels(labels, fontsize=11.5, rotation=24, ha="center", rotation_mode="anchor")
         ax.tick_params(axis="x", pad=16)
         ax.set_ylabel("NSE", fontsize=15, fontweight="bold")
-        ymax = float(np.nanmax(vals) + 0.16)
+        finite_vals = vals[np.isfinite(vals)]
+        ymax = float(np.nanmax(finite_vals) + 0.16) if finite_vals.size else 1.0
         ax.set_ylim(0.0, min(1.05, max(0.78, ymax)))
         ax.set_yticks(np.arange(0.0, 1.01, 0.2))
         ax.grid(True, axis="y", linestyle=(0, (1.5, 2.5)), alpha=0.32)
@@ -548,7 +664,7 @@ def save_stfusionnet_horizon_nse_panels(
     horizon_hours: Sequence[int],
     horizon_indices: Sequence[int],
 ) -> None:
-    """Save STFusionNet NSE bars by forecast horizon, matching custom-mode style."""
+    """Save STFusionNet NSE bars by forecast horizon, matching the reference style."""
     apply_paper_style()
     st_metrics = model_metrics.get("STFusionNet") or metrics
     feature_colors = ["#1f77b4", "#2ca02c", "#ff8c00", "#17a2c0", "#9c0ca3", "#c61d1d"]
@@ -745,7 +861,7 @@ def save_timeseries(metrics: Dict[str, Any], analysis_npz: str, out_dir: Path, h
         else:
             x = np.arange(len(np.asarray(truth).reshape(-1)))
         x_line, _, pred_line, x_scatter, truth_scatter = prepare_timeseries(x, truth, pred, max_points)
-        nse, _rmse, mae = quick_metrics(truth, pred)
+        nse, _rmse, mae = compute_basic_metrics(truth, pred)
         if not np.isfinite(nse):
             nse = feature_nse_horizon(metrics, feature, horizon_idx)
         if not np.isfinite(mae):
@@ -825,10 +941,10 @@ def save_scatter(metrics: Dict[str, Any], analysis_npz: str, out_dir: Path, hori
                 order = np.argsort(xx)
                 coef = np.polyfit(xx[order], yy[order], 1)
                 ax.plot(xx[order], coef[0] * xx[order] + coef[1], color=colors[label], lw=1.2, zorder=3)
-            nse_g, _rmse_g, mae_g = quick_metrics(truth[gmask], pred[gmask])
+            nse_g, _rmse_g, mae_g = compute_basic_metrics(truth[gmask], pred[gmask])
             if np.isfinite(nse_g):
                 ax.text(positions[label][0], positions[label][1], f"NSE={nse_g:.2f}\nMAE={format_metric_value(mae_g)}", transform=ax.transAxes, color=colors[label], fontsize=9.5, fontweight="bold")
-        nse, _rmse, mae = quick_metrics(truth, pred)
+        nse, _rmse, mae = compute_basic_metrics(truth, pred)
         if not np.isfinite(nse):
             nse = feature_metric(metrics, feature, "nse")
         if not np.isfinite(mae):
@@ -855,6 +971,7 @@ def main() -> None:
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--summary_json", default="")
     parser.add_argument("--test_metrics", default="")
+    parser.add_argument("--ablation_results", default="")
     parser.add_argument("--analysis_npz", default="")
     parser.add_argument("--horizon_idx", type=int, default=None)
     parser.add_argument("--plot_horizon_hours", type=int, default=12)
@@ -864,6 +981,7 @@ def main() -> None:
         raise ValueError("Please provide --test_metrics.")
     metrics = load_json(args.test_metrics)
     model_metrics = collect_model_metrics(args.summary_json, metrics)
+    ablation_results = load_ablation_results(args.ablation_results)
     horizon_hours, horizon_indices = infer_report_horizons(metrics, model_metrics, args.test_metrics, args.summary_json)
     plot_horizon_idx = resolve_plot_horizon_idx(args.plot_horizon_hours, args.horizon_idx, horizon_hours, horizon_indices)
     plot_model_metrics = select_model_metrics_for_horizon(model_metrics, args.plot_horizon_hours)
@@ -871,7 +989,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     save_ablation_matrix(out_dir)
     save_stfusionnet_horizon_nse_panels(metrics, out_dir, model_metrics, horizon_hours, horizon_indices)
-    save_nse_panels(metrics, out_dir)
+    save_nse_panels(metrics, out_dir, ablation_results, args.plot_horizon_hours)
     save_horizon_lines(metrics, out_dir, model_metrics, horizon_hours, horizon_indices)
     save_metric_bars(metrics, out_dir, plot_model_metrics)
     if args.analysis_npz and Path(args.analysis_npz).exists():

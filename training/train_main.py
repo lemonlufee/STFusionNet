@@ -1181,7 +1181,9 @@ def tune_then_train(
         trial_params = trial_params[:tune_limit]
 
     model_tag = f"{model_name}"
-    tune_root = os.path.join(cfg.EXP_ROOT, f"{base_run_id}_{model_tag}_tune")
+    run_tag = str(getattr(cfg, "RUN_TAG", "") or "").strip()
+    tune_tag = f"{model_tag}_{run_tag}" if run_tag else model_tag
+    tune_root = os.path.join(cfg.EXP_ROOT, f"{base_run_id}_{tune_tag}_tune")
     ensure_dir(tune_root)
 
     results: List[Dict[str, Any]] = []
@@ -1330,6 +1332,8 @@ def tune_then_train(
 
     final_res["best_hparams"] = best_params
     final_res["tuning_root"] = tune_root
+    final_res["run_id"] = run_id
+    final_res["run_dir"] = final_dir
     return final_res
 
 
@@ -1366,8 +1370,17 @@ def _canonical_model_key(name: str) -> str:
 
 
 def _is_tunable_model(name: str) -> bool:
-    """Only STFusionNet exposes optional hyperparameter search."""
-    return _canonical_model_key(name) in {"stgcn_fusion"}
+    """Return whether the model participates in full-mode hyperparameter search."""
+    return _canonical_model_key(name) in {
+        "stgcn_fusion",
+        "cnn",
+        "tcn",
+        "lstm",
+        "itransformer",
+        "patchtst",
+        "stgcn",
+        "dcrnn",
+    }
 
 
 def _apply_model_params(cfg: Config, model_name: str) -> None:
@@ -1407,7 +1420,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exp_root", type=str, default=None)
     parser.add_argument("--tag", type=str, default=None, help="Extra suffix appended to run_id")
     parser.add_argument("--load_run_id", type=str, default=None, help="LOAD_RUN_ID used in eval mode")
-    parser.add_argument("--top_k_lakes", type=int, default=None, help="Use only the first K selected stations for faster smoke runs")
+    parser.add_argument("--top_k_lakes", type=int, default=None, help="Use only the first K selected stations")
     parser.add_argument("--min_effective_steps", type=int, default=None, help="Minimum effective time-step threshold")
     parser.add_argument("--seq_len", type=int, default=None, help="Override SEQ_LEN from config")
     parser.add_argument("--pred_len", type=int, default=None, help="Override PRED_LEN from config")
@@ -1529,7 +1542,7 @@ def main():
                 # Apply per-model default hyper-parameters (MODEL_PARAMS) if provided.
                 # This enables "one-set default params" behavior for each model.
                 _apply_model_params(cfg_m, m)
-                # Re-apply CLI overrides so smoke/quick settings are not overwritten by MODEL_PARAMS.
+                # Re-apply CLI overrides so command-line settings are not overwritten by MODEL_PARAMS.
                 if args.seq_len is not None:
                     cfg_m.SEQ_LEN = int(args.seq_len)
                 if args.pred_len is not None and horizon_hour is None:
@@ -1546,10 +1559,10 @@ def main():
                 set_seed(int(getattr(cfg_m, "TUNE_RANDOM_SEED", 2027)))
 
                 # Decide whether to do hyper-parameter search.
-                # - For STFusionNet only: cfg_m.STFUSIONNET_TUNE_MODE controls default vs search.
-                # - For other models: no tuning (baseline fairness / speed).
+                # In full mode all paper models are tunable for fair comparison.
+                # STFUSIONNET_TUNE_MODE can still disable only STFusionNet search.
                 do_tune = bool(cfg_m.AUTO_TUNE) and _is_tunable_model(m)
-                if _is_tunable_model(m):
+                if _canonical_model_key(m) == "stgcn_fusion":
                     mode = str(getattr(cfg_m, "STFUSIONNET_TUNE_MODE", "search")).lower()
                     if mode == "default":
                         do_tune = False

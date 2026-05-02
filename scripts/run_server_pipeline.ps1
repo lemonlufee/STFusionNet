@@ -1,7 +1,5 @@
 param(
     [string]$PythonPath = "",
-    [ValidateSet("full", "quick")]
-    [string]$Mode = "full",
     [string]$RunTag = "server",
     [string]$ExpRoot = "Training_time_log",
     [string]$AblationRoot = "ablation_results",
@@ -63,7 +61,7 @@ Set-Location $ProjectRoot
 
 $PythonPath = Resolve-Python $PythonPath
 
-$Tag = "${RunTag}_${Mode}"
+$Tag = $RunTag
 
 Write-Section "Environment Check"
 Invoke-Step "Python version" { & $PythonPath -V }
@@ -77,21 +75,10 @@ $ablationEpochs = 50
 $sensitivityEpochs = 50
 $dataArgs = @()
 $trainHorizonArgs = @("--separate_horizons", "--horizon_hours", "12,24,48,120,168")
-$trainTuneArgs = @("--no_tune", "--stf_mode", "default")
+$trainTuneArgs = @("--tune", "--stf_mode", "search", "--search_method", "grid", "--trials", "48")
 
-if ($Mode -eq "quick") {
-    # Quick smoke for server validation
-    $modelList = "stgcn_fusion,cnn,tcn,lstm,itransformer,patchtst,stgcn,dcrnn"
-    # Minimal set that still satisfies reviewer-required 3 ablations:
-    # 1) no adaptive adjacency, 2) single temporal branch, 3) no gated fusion.
-    $ablationVariants = "full,w_o_adaptive_adj,temporal_cnn_only,fusion_avg"
-    $sensK = "3,6,10,15"
-    $sensSigma = "10,20,30"
-    $ablationEpochs = 1
-    $sensitivityEpochs = 1
-    $dataArgs = @("--top_k_lakes", "4", "--min_effective_steps", "120", "--seq_len", "12", "--batch_size", "16")
-    $trainTuneArgs = @("--no_tune", "--stf_mode", "default", "--max_epochs", "1")
-}
+$ablationTuneArgs = @("--tune", "--search_method", "grid", "--trials", "48", "--separate_horizons", "--horizon_hours", "12,24,48,120,168")
+$sensitivityTuneArgs = @("--tune", "--search_method", "grid", "--trials", "48", "--separate_horizons", "--horizon_hours", "12,24,48,120,168")
 
 if (-not $SkipTrain) {
     Write-Section "Training"
@@ -119,7 +106,7 @@ if (-not $SkipAblation) {
             "--max_epochs", "$ablationEpochs",
             "--results_root", $AblationRoot,
             "--seed", "2025"
-        ) + $dataArgs
+        ) + $ablationTuneArgs + $dataArgs
         & $PythonPath @argsList
     }
 }
@@ -134,7 +121,7 @@ if (-not $SkipSensitivity) {
             "--max_epochs", "$sensitivityEpochs",
             "--exp_root", $AblationRoot,
             "--tag", "${Tag}_graph_sens"
-        ) + $dataArgs
+        ) + $sensitivityTuneArgs + $dataArgs
         & $PythonPath @argsList
     }
 }
@@ -167,6 +154,9 @@ if (-not $SkipViz) {
     if ($null -ne $latestTestMetric) {
         $metricsPath = $latestTestMetric.FullName
         $analysisPath = Join-Path $latestTestMetric.Directory.FullName "analysis_data.npz"
+        $latestAblation = Get-ChildItem -Path $AblationRoot -Recurse -Filter "ablation_results.json" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
         Invoke-Step "Render thesis figures from metrics" {
             $argsList = @(
                 "-m", "visualization.viz_paper_figures",
@@ -176,6 +166,9 @@ if (-not $SkipViz) {
             )
             if (Test-Path $summaryPath) {
                 $argsList += @("--summary_json", $summaryPath)
+            }
+            if ($null -ne $latestAblation) {
+                $argsList += @("--ablation_results", $latestAblation.FullName)
             }
             if (Test-Path $analysisPath) {
                 $argsList += @("--analysis_npz", $analysisPath)
