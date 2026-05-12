@@ -92,14 +92,6 @@ bash run_all_server.sh --python /path/to/python
 
 The full pipeline uses the complete model set, full ablation variants, full sensitivity settings, and horizon-specific training. Main model comparison is trained as independent forecast-horizon runs for `12h`, `24h`, `48h`, `120h`, and `168h`; each horizon has its own `PRED_LEN`, run directory, and metric record. The five forecast horizons are part of the same Full-model experiment design: they are not separate ablation variants.
 
-The pipeline enables paper-style hyperparameter search for the main model comparison, ablation variants, and graph sensitivity runs. Each model/variant/graph-setting is tuned separately at each required forecast horizon using the same compact grid:
-
-- `SEQ_LEN`: `18`, `30`, `42`;
-- hidden size: `32`, `64`, `128`, `256`;
-- learning rate: `5e-5`, `1e-4`, `3e-4`, `1e-3`.
-
-This gives `48` tuning trials plus one final training run for each model/variant/graph-setting at each horizon. With the default full configuration, the expected number of training executions is `6615`: `1960` for model comparison, `1715` for ablation, and `2940` for graph-parameter sensitivity.
-
 ## Figure Generation Notes
 
 The pipeline renders metric-based figures from the latest `test_metrics.json` found under the selected experiment root.

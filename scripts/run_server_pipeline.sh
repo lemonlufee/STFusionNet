@@ -169,37 +169,74 @@ fi
 if [[ ${SKIP_VIZ} -eq 0 ]]; then
   echo "==================== Visualization ===================="
   VIZ_DIR="${EXP_ROOT}"
-
   summary_json="${EXP_ROOT}/${TAG}_summary.json"
-  preferred_test_metrics="$(find "${EXP_ROOT}" -type f -path "*stgcn_fusion*_${TAG}_h12h/test_metrics.json" 2>/dev/null | head -n 1 || true)"
-  if [[ -z "${preferred_test_metrics}" ]]; then
-    preferred_test_metrics="$(find "${EXP_ROOT}" -type f -path "*stgcn_fusion*_h12h/test_metrics.json" 2>/dev/null | head -n 1 || true)"
-  fi
-  latest_test_metrics="${preferred_test_metrics}"
-  if [[ -z "${latest_test_metrics}" ]]; then
-    latest_test_metrics="$(find "${EXP_ROOT}" -type f -name test_metrics.json 2>/dev/null | xargs -r ls -t | head -n 1 || true)"
-  fi
-  if [[ -n "${latest_test_metrics}" ]]; then
-    analysis_npz="$(dirname "${latest_test_metrics}")/analysis_data.npz"
-    latest_ablation="$(find "${ABLATION_ROOT}" -type f -name ablation_results.json 2>/dev/null | xargs -r ls -t | head -n 1 || true)"
-    viz_args=(
-      -m visualization.viz_paper_figures
-      --test_metrics "${latest_test_metrics}"
-      --plot_horizon_hours 12
-      --out_dir "${VIZ_DIR}"
-    )
-    if [[ -f "${summary_json}" ]]; then
-      viz_args+=(--summary_json "${summary_json}")
-    fi
-    if [[ -n "${latest_ablation}" && -f "${latest_ablation}" ]]; then
-      viz_args+=(--ablation_results "${latest_ablation}")
-    fi
-    if [[ -f "${analysis_npz}" ]]; then
-      viz_args+=(--analysis_npz "${analysis_npz}")
-    fi
-    run_step "Render thesis figures from metrics" "${PYTHON_PATH}" "${viz_args[@]}"
+
+  if [[ ! -f "${summary_json}" ]]; then
+    echo "[WARN] Summary JSON not found: ${summary_json}. Skip visualization."
   else
-    echo "[WARN] No test_metrics.json found; skip inference visualizations."
+    # Resolve STFusionNet 12h run_dir from the summary JSON rather than
+    # picking the newest file by mtime, so an older run directory left
+    # behind from a previous pipeline does not hijack the figures.
+    stf_run_dir="$(
+      "${PYTHON_PATH}" - "${summary_json}" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)
+targets = {"stgcn_fusion", "stfusionnet"}
+matches = []
+for r in (data.get("results") or []):
+    if not isinstance(r, dict):
+        continue
+    name = str(r.get("model", "")).strip().lower()
+    if name not in targets:
+        continue
+    horizon = r.get("horizon_hours")
+    if horizon is None:
+        continue
+    try:
+        if int(horizon) == 12:
+            matches.append(r)
+    except Exception:
+        continue
+if not matches:
+    sys.exit(0)
+run_dir = matches[0].get("run_dir") or ""
+if run_dir:
+    print(run_dir)
+PY
+)"
+    stf_run_dir="${stf_run_dir//$'\r'/}"
+
+    if [[ -z "${stf_run_dir}" ]]; then
+      echo "[WARN] ${summary_json} has no STFusionNet 12h entry with run_dir. Skip visualization."
+    elif [[ ! -f "${stf_run_dir}/test_metrics.json" ]]; then
+      echo "[WARN] STFusionNet 12h run_dir '${stf_run_dir}' has no test_metrics.json. Skip visualization."
+    else
+      stf_test_metrics="${stf_run_dir}/test_metrics.json"
+      stf_analysis_npz="${stf_run_dir}/analysis_data.npz"
+      latest_ablation="$(find "${ABLATION_ROOT}" -type f -name ablation_results.json 2>/dev/null | xargs -r ls -t | head -n 1 || true)"
+
+      viz_args=(
+        -m visualization.viz_paper_figures
+        --summary_json "${summary_json}"
+        --test_metrics "${stf_test_metrics}"
+        --plot_horizon_hours 12
+        --out_dir "${VIZ_DIR}"
+      )
+      if [[ -f "${stf_analysis_npz}" ]]; then
+        viz_args+=(--analysis_npz "${stf_analysis_npz}")
+      else
+        echo "[WARN] STFusionNet 12h run_dir '${stf_run_dir}' has no analysis_data.npz; sequence/scatter figures may be incomplete."
+      fi
+      if [[ -n "${latest_ablation}" && -f "${latest_ablation}" ]]; then
+        viz_args+=(--ablation_results "${latest_ablation}")
+      fi
+
+      run_step "Render thesis figures from metrics" "${PYTHON_PATH}" "${viz_args[@]}"
+    fi
   fi
 fi
 

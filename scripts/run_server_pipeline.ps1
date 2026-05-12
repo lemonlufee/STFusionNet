@@ -139,46 +139,72 @@ if (-not $SkipViz) {
     $vizDir = $ExpRoot
 
     $summaryPath = Join-Path $ExpRoot "${Tag}_summary.json"
-    $preferredTestMetric = Get-ChildItem -Path $ExpRoot -Recurse -Filter "test_metrics.json" -ErrorAction SilentlyContinue |
-        Where-Object { $_.Directory.Name -like "*stgcn_fusion*_${Tag}_h12h" -or $_.Directory.Name -like "*stgcn_fusion*_h12h" } |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
 
-    $latestTestMetric = $preferredTestMetric
-    if ($null -eq $latestTestMetric) {
-        $latestTestMetric = Get-ChildItem -Path $ExpRoot -Recurse -Filter "test_metrics.json" -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
-    }
-
-    if ($null -ne $latestTestMetric) {
-        $metricsPath = $latestTestMetric.FullName
-        $analysisPath = Join-Path $latestTestMetric.Directory.FullName "analysis_data.npz"
-        $latestAblation = Get-ChildItem -Path $AblationRoot -Recurse -Filter "ablation_results.json" -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
-        Invoke-Step "Render thesis figures from metrics" {
-            $argsList = @(
-                "-m", "visualization.viz_paper_figures",
-                "--test_metrics", $metricsPath,
-                "--plot_horizon_hours", "12",
-                "--out_dir", $vizDir
-            )
-            if (Test-Path $summaryPath) {
-                $argsList += @("--summary_json", $summaryPath)
-            }
-            if ($null -ne $latestAblation) {
-                $argsList += @("--ablation_results", $latestAblation.FullName)
-            }
-            if (Test-Path $analysisPath) {
-                $argsList += @("--analysis_npz", $analysisPath)
-            }
-            & $PythonPath @argsList
-        }
+    if (-not (Test-Path $summaryPath)) {
+        Write-Host "[WARN] Summary JSON not found: $summaryPath. Skip visualization."
     } else {
-        Write-Host "[WARN] No test_metrics.json found. Skip inference visualizations."
-    }
+        # Resolve STFusionNet 12h run_dir from the summary JSON rather than
+        # picking the newest file by mtime, so an older run directory left
+        # behind from a previous pipeline does not hijack the figures.
+        $stfRunDir = ""
+        try {
+            $summaryRaw = Get-Content -LiteralPath $summaryPath -Raw -Encoding UTF8
+            $summaryObj = $summaryRaw | ConvertFrom-Json
+            $resultsList = @()
+            if ($null -ne $summaryObj.results) {
+                $resultsList = @($summaryObj.results)
+            }
+            $stfNames = @("stgcn_fusion", "stfusionnet")
+            foreach ($item in $resultsList) {
+                if ($null -eq $item) { continue }
+                $modelNameRaw = ""
+                if ($null -ne $item.model) { $modelNameRaw = [string]$item.model }
+                $modelName = $modelNameRaw.Trim().ToLower()
+                if ($stfNames -notcontains $modelName) { continue }
+                if ($null -eq $item.horizon_hours) { continue }
+                $horizonVal = 0
+                if (-not [int]::TryParse([string]$item.horizon_hours, [ref]$horizonVal)) { continue }
+                if ($horizonVal -ne 12) { continue }
+                if ($null -ne $item.run_dir -and -not [string]::IsNullOrWhiteSpace([string]$item.run_dir)) {
+                    $stfRunDir = [string]$item.run_dir
+                    break
+                }
+            }
+        } catch {
+            Write-Host "[WARN] Failed to parse summary JSON: $($_.Exception.Message)"
+        }
 
+        if ([string]::IsNullOrWhiteSpace($stfRunDir)) {
+            Write-Host "[WARN] $summaryPath has no STFusionNet 12h entry with run_dir. Skip visualization."
+        } elseif (-not (Test-Path (Join-Path $stfRunDir "test_metrics.json"))) {
+            Write-Host "[WARN] STFusionNet 12h run_dir '$stfRunDir' has no test_metrics.json. Skip visualization."
+        } else {
+            $stfTestMetrics = Join-Path $stfRunDir "test_metrics.json"
+            $stfAnalysisNpz = Join-Path $stfRunDir "analysis_data.npz"
+            $latestAblation = Get-ChildItem -Path $AblationRoot -Recurse -Filter "ablation_results.json" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 1
+
+            Invoke-Step "Render thesis figures from metrics" {
+                $argsList = @(
+                    "-m", "visualization.viz_paper_figures",
+                    "--summary_json", $summaryPath,
+                    "--test_metrics", $stfTestMetrics,
+                    "--plot_horizon_hours", "12",
+                    "--out_dir", $vizDir
+                )
+                if (Test-Path $stfAnalysisNpz) {
+                    $argsList += @("--analysis_npz", $stfAnalysisNpz)
+                } else {
+                    Write-Host "[WARN] STFusionNet 12h run_dir '$stfRunDir' has no analysis_data.npz; sequence/scatter figures may be incomplete."
+                }
+                if ($null -ne $latestAblation) {
+                    $argsList += @("--ablation_results", $latestAblation.FullName)
+                }
+                & $PythonPath @argsList
+            }
+        }
+    }
 }
 
 if (-not $SkipPack) {
